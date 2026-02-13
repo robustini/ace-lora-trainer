@@ -45,13 +45,13 @@ uv pip install -r requirements.txt
 # Or: pip install -r requirements.txt
 ```
 
-### 2. Download ACE-Step Model
+### 2. Models
 
-The model will be auto-downloaded on first use, or you can pre-download:
+**ACE-Step (generation model)** — Auto-downloaded on first launch to `./checkpoints/`.
 
-```bash
-# Place checkpoints in ./checkpoints/acestep-v15-turbo/
-```
+**Captioner & Transcriber** — Auto-downloaded from HuggingFace on first use:
+- Captioner: `ACE-Step/acestep-captioner` (~22GB)
+- Transcriber: `ACE-Step/acestep-transcriber` (~22GB)
 
 ### 3. Launch
 
@@ -68,12 +68,14 @@ python launch.py --mode both
 
 ## Recommended Settings by GPU
 
-| GPU | Preset | Batch | Rank | Optimizer | VRAM Features |
-|-----|--------|-------|------|-----------|---------------|
-| RTX 4090 / 5090 | 24GB+ | 3 | 64 | Prodigy | None needed |
-| RTX 3090 / 4080 | 16-24GB | 2 | 64 | Prodigy | None needed |
-| RTX 3080 / 4070 | 10-12GB | 1 | 32 | AdamW 8bit | Grad Ckpt + Offload |
-| RTX 3060 / 4060 | 8GB | 1 | 16 | AdamW 8bit | Grad Ckpt + Offload |
+| GPU | VRAM | Batch | Rank | Optimizer | Scheduler | VRAM Features |
+|-----|------|-------|------|-----------|-----------|---------------|
+| RTX 4090 / 5090 | 24GB+ | 3 | 64 | Prodigy | Cosine | None needed |
+| RTX 3090 / 4080 | 16-24GB | 2 | 64 | Prodigy | Cosine | None needed |
+| RTX 3080 / 4070 | 10-12GB | 1 | 32 | AdamW 8bit | Cosine | Grad Ckpt + Offload |
+| RTX 3060 / 4060 | 8GB | 1 | 16 | Adafactor | Constant+Warmup | Grad Ckpt + Offload |
+
+> **Note (8GB):** With only 8GB VRAM, AdamW 8-bit may still OOM. Adafactor stores nearly zero optimizer state, making it the safest choice for low-VRAM GPUs.
 
 ## Training Workflow
 
