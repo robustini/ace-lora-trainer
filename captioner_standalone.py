@@ -637,7 +637,7 @@ class AceStepCaptioner:
             torch.cuda.empty_cache()
 
 
-DEFAULT_MODEL_PATH = "D:/pinokio/drive/drives/peers/d1770283842446/checkpoints/acestep-captioner"
+DEFAULT_MODEL_PATH = "ACE-Step/acestep-captioner"
 DEFAULT_TRANSCRIBER_PATH = "ACE-Step/acestep-transcriber"
 
 
