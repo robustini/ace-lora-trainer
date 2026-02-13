@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model checkpoints (large files)
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Training outputs
+lora_output/
+datasets/preprocessed_tensors/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Gradio
+flagged/
+*.tmp
+
+# Misc
+*.log

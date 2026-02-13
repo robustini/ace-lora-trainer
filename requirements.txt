@@ -1,0 +1,59 @@
+# ============================================================
+# ACE-Step LoRA Trainer + Captioner — Requirements
+# ============================================================
+# Install: uv pip install -r requirements.txt
+# Or:      pip install -r requirements.txt
+# ============================================================
+
+# --- PyTorch with CUDA 12.8 ---
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1; sys_platform == 'win32'
+torchaudio==2.7.1; sys_platform == 'win32'
+torchvision; sys_platform == 'win32'
+# macOS arm64 (Apple Silicon)
+torch>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'
+torchaudio>=2.9.1; sys_platform == 'darwin' and platform_machine == 'arm64'
+torchvision; sys_platform == 'darwin' and platform_machine == 'arm64'
+# Linux
+torch==2.7.1; sys_platform != 'win32' and sys_platform != 'darwin'
+torchaudio==2.7.1; sys_platform != 'win32' and sys_platform != 'darwin'
+torchvision; sys_platform != 'win32' and sys_platform != 'darwin'
+
+# --- Core ML ---
+transformers>=4.51.0,<4.58.0
+diffusers
+accelerate>=1.12.0
+einops>=0.8.1
+torchao
+
+# --- Training ---
+peft>=0.7.0
+lightning>=2.0.0
+prodigyopt>=1.1.0
+
+# --- Audio Processing ---
+soundfile>=0.13.1
+librosa
+scipy>=1.10.1
+numba>=0.63.1
+
+# --- UI ---
+gradio>=6.5.1
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+
+# --- Utilities ---
+loguru>=0.7.3
+matplotlib>=3.7.5
+pandas
+modelscope
+
+# --- Attention / Acceleration ---
+triton-windows>=3.0.0,<3.4; sys_platform == 'win32'
+triton>=3.0.0; sys_platform != 'win32'
+flash-attn; sys_platform != 'win32'
+xxhash
+
+# --- Optional: 8-bit optimizer (saves ~30-40% VRAM) ---
+# Uncomment if you want AdamW 8-bit support:
+# bitsandbytes>=0.43.0; sys_platform != 'darwin'
