@@ -30,7 +30,7 @@ A standalone Gradio UI for training LoRA adapters on [ACE-Step 1.5](https://gith
 
 ```bash
 # Clone this repo
-git clone https://github.com/YOUR_USERNAME/ace-lora-trainer.git
+git clone https://github.com/Estylon/ace-lora-trainer.git
 cd ace-lora-trainer
 
 # Create virtual environment
