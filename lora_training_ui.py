@@ -698,6 +698,163 @@ def preprocess_dataset(
     return status, get_status_html()
 
 
+# ============== VRAM Monitor ==============
+
+def get_vram_info() -> dict:
+    """Get current VRAM usage info. Returns dict with total, used, free in GB."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {"available": False, "error": "CUDA not available"}
+
+        gpu_name = torch.cuda.get_device_name(0)
+        total = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+        reserved = torch.cuda.memory_reserved(0) / (1024**3)
+        allocated = torch.cuda.memory_allocated(0) / (1024**3)
+
+        # Use nvidia-smi for accurate system-wide VRAM usage
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used,memory.free,memory.total",
+                 "--format=csv,noheader,nounits", "-i", "0"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                parts = result.stdout.strip().split(",")
+                smi_used = float(parts[0].strip()) / 1024  # MB to GB
+                smi_free = float(parts[1].strip()) / 1024
+                smi_total = float(parts[2].strip()) / 1024
+                return {
+                    "available": True,
+                    "gpu_name": gpu_name,
+                    "total_gb": round(smi_total, 1),
+                    "used_gb": round(smi_used, 1),
+                    "free_gb": round(smi_free, 1),
+                    "torch_allocated_gb": round(allocated, 1),
+                    "torch_reserved_gb": round(reserved, 1),
+                }
+        except Exception:
+            pass
+
+        # Fallback to torch-only info
+        free_approx = total - reserved
+        return {
+            "available": True,
+            "gpu_name": gpu_name,
+            "total_gb": round(total, 1),
+            "used_gb": round(reserved, 1),
+            "free_gb": round(free_approx, 1),
+            "torch_allocated_gb": round(allocated, 1),
+            "torch_reserved_gb": round(reserved, 1),
+        }
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+def get_other_gpu_processes() -> list:
+    """Get list of OTHER processes using the GPU (not this Python process)."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+
+        current_pid = os.getpid()
+        processes = []
+        for line in result.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                pid = int(parts[0])
+                name = parts[1]
+                mem_mb = float(parts[2]) if parts[2].strip() else 0
+                if pid != current_pid:
+                    processes.append({
+                        "pid": pid,
+                        "name": os.path.basename(name),
+                        "mem_gb": round(mem_mb / 1024, 1),
+                    })
+        return processes
+    except Exception:
+        return []
+
+
+def format_vram_status() -> str:
+    """Format a human-readable VRAM status string for the UI."""
+    info = get_vram_info()
+    if not info.get("available"):
+        return f"⚠️ GPU: {info.get('error', 'Unknown error')}"
+
+    used_pct = (info['used_gb'] / info['total_gb'] * 100) if info['total_gb'] > 0 else 0
+
+    # Status icon based on free VRAM
+    if info['free_gb'] >= 16:
+        icon = "🟢"
+    elif info['free_gb'] >= 8:
+        icon = "🟡"
+    else:
+        icon = "🔴"
+
+    lines = [
+        f"{icon} {info['gpu_name']}",
+        f"   VRAM: {info['used_gb']:.1f} / {info['total_gb']:.1f} GB used ({used_pct:.0f}%) — {info['free_gb']:.1f} GB free",
+    ]
+
+    # Check for other GPU processes
+    other_procs = get_other_gpu_processes()
+    if other_procs:
+        lines.append(f"   ⚠️ Other processes using GPU:")
+        for p in other_procs:
+            lines.append(f"      • {p['name']} (PID {p['pid']}) — {p['mem_gb']:.1f} GB")
+        lines.append(f"   💡 Close these for more available VRAM")
+
+    return "\n".join(lines)
+
+
+def check_vram_before_training(batch_size: int, lora_rank: int, gradient_checkpointing: bool, encoder_offloading: bool) -> str:
+    """Check VRAM availability before starting training. Returns warning or empty string."""
+    info = get_vram_info()
+    if not info.get("available"):
+        return ""
+
+    # Estimate VRAM needed for training (rough approximation)
+    # Base model (already loaded via initialize): ~5GB
+    # LoRA overhead: ~0.5-2GB depending on rank
+    # Training batch: ~2-4GB per sample depending on crop length
+    # Optimizer states: ~1-3GB depending on optimizer
+    base_training_vram = 3.0  # minimum overhead for training loop
+    per_batch_vram = 2.5 if not gradient_checkpointing else 1.5
+    estimated_need = base_training_vram + (batch_size * per_batch_vram)
+
+    if encoder_offloading:
+        estimated_need -= 2.0
+
+    warnings = []
+
+    other_procs = get_other_gpu_processes()
+    if other_procs:
+        total_other = sum(p['mem_gb'] for p in other_procs)
+        proc_names = ", ".join(f"{p['name']}({p['mem_gb']:.1f}GB)" for p in other_procs)
+        warnings.append(
+            f"⚠️ Other GPU processes detected: {proc_names} — using {total_other:.1f} GB\n"
+            f"   Close them for better training performance."
+        )
+
+    if info['free_gb'] < estimated_need:
+        warnings.append(
+            f"⚠️ Low VRAM: {info['free_gb']:.1f} GB free, estimated ~{estimated_need:.0f} GB needed.\n"
+            f"   Try: reduce batch size, enable gradient checkpointing, or enable encoder offloading."
+        )
+
+    return "\n".join(warnings)
+
+
 # ============== Training Functions ==============
 
 def _recommend_epochs(num_samples: int) -> tuple:
@@ -820,6 +977,16 @@ def start_training(
         yield f"❌ Missing packages: {e}\nInstall: pip install peft lightning", "", None, training_state, get_status_html()
         return
 
+    # VRAM pre-flight check
+    vram_warning = check_vram_before_training(
+        batch_size=batch_size,
+        lora_rank=lora_rank,
+        gradient_checkpointing=gradient_checkpointing_flag,
+        encoder_offloading=encoder_offloading_flag,
+    )
+    if vram_warning:
+        logger.warning(f"VRAM pre-flight: {vram_warning}")
+
     training_state["is_training"] = True
     training_state["should_stop"] = False
 
@@ -865,7 +1032,10 @@ def start_training(
 
         type_label = "⚡ Turbo" if not is_base else f"🎯 Base (CFG={guidance_scale_val}, steps={num_inference_steps_val})"
         opt_label = optimizer_type_val or "adamw"
-        yield f"🚀 Starting {type_label} training ({opt_label})...", "", loss_data, training_state, get_status_html()
+        start_msg = f"🚀 Starting {type_label} training ({opt_label})..."
+        if vram_warning:
+            start_msg += f"\n{vram_warning}"
+        yield start_msg, "", loss_data, training_state, get_status_html()
 
         trainer = LoRATrainer(
             dit_handler=dit_handler,
@@ -1808,6 +1978,10 @@ def create_ui():
             # Training Controls
             gr.HTML('<div class="section-title" style="margin-top:20px">🚀 Training</div>')
 
+            # VRAM Monitor
+            vram_status = gr.Textbox(label="🎮 GPU Status", interactive=False, lines=3)
+            vram_refresh_btn = gr.Button("🔄 Refresh GPU Status", size="sm", variant="secondary")
+
             with gr.Row():
                 start_training_btn = gr.Button("🚀 Start Training", variant="primary", size="lg", scale=2, elem_classes="primary-action")
                 stop_training_btn = gr.Button("⏹️ Stop", variant="stop", size="lg", scale=1)
@@ -1952,6 +2126,11 @@ def create_ui():
             inputs=[preprocess_output_dir, max_duration_slider, custom_tag, tag_position, dataset_builder_state],
             outputs=[preprocess_progress, status_bar],
         )
+
+        # VRAM Monitor
+        vram_refresh_btn.click(fn=format_vram_status, outputs=[vram_status])
+        # Auto-refresh VRAM when switching to Train tab
+        demo.load(fn=format_vram_status, outputs=[vram_status])
 
         # Training
         load_tensors_btn.click(fn=load_tensor_dataset, inputs=[training_tensor_dir], outputs=[training_dataset_info, max_epochs, save_every_n_epochs])
