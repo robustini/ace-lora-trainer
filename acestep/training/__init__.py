@@ -6,7 +6,7 @@ including dataset building, audio labeling, and training utilities.
 """
 
 from acestep.training.dataset_builder import DatasetBuilder, AudioSample
-from acestep.training.configs import LoRAConfig, TrainingConfig
+from acestep.training.configs import LoRAConfig, LoKRConfig, TrainingConfig
 from acestep.training.configs import detect_best_precision, precision_to_dtype, precision_to_fabric_str
 from acestep.training.lora_utils import (
     inject_lora_into_dit,
@@ -30,6 +30,18 @@ from acestep.training.data_module import (
 )
 from acestep.training.trainer import LoRATrainer, PreprocessedLoRAModule, LIGHTNING_AVAILABLE
 
+# Optional: LoKr support via LyCORIS
+try:
+    from acestep.training.lokr_utils import (
+        inject_lokr_into_dit,
+        save_lokr_weights,
+        load_lokr_weights,
+        merge_lokr_weights,
+        check_lycoris_available,
+    )
+except ImportError:
+    pass  # LyCORIS not installed — LoKr features not available
+
 def check_lightning_available():
     """Check if Lightning Fabric is available."""
     return LIGHTNING_AVAILABLE
@@ -40,6 +52,7 @@ __all__ = [
     "AudioSample",
     # Configs
     "LoRAConfig",
+    "LoKRConfig",
     "TrainingConfig",
     # LoRA Utils
     "inject_lora_into_dit",

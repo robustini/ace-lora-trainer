@@ -44,6 +44,18 @@ from acestep.training.lora_utils import (
 )
 from acestep.training.data_module import PreprocessedDataModule
 
+# Optional: LyCORIS for LoKr support
+try:
+    from acestep.training.lokr_utils import (
+        inject_lokr_into_dit,
+        save_lokr_weights,
+        save_lokr_training_checkpoint,
+        check_lycoris_available,
+    )
+    LOKR_IMPORTS_OK = True
+except ImportError:
+    LOKR_IMPORTS_OK = False
+
 
 def create_optimizer(params, training_config) -> torch.optim.Optimizer:
     """Create optimizer based on training config.
@@ -274,6 +286,7 @@ class PreprocessedLoRAModule(nn.Module):
         training_config: TrainingConfig,
         device: torch.device,
         dtype: torch.dtype,
+        lokr_config=None,
     ):
         """Initialize the training module.
 
@@ -283,6 +296,7 @@ class PreprocessedLoRAModule(nn.Module):
             training_config: Training configuration
             device: Device to use
             dtype: Data type to use
+            lokr_config: Optional LoKRConfig for LoKr training
         """
         super().__init__()
 
@@ -291,15 +305,33 @@ class PreprocessedLoRAModule(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        # Inject LoRA into the decoder only
-        if check_peft_available():
-            attention_type = getattr(training_config, 'attention_type', 'both')
+        # Determine adapter type
+        adapter_type = getattr(training_config, 'adapter_type', 'lora')
+        self.adapter_type = adapter_type
+        self.lycoris_net = None  # Only set for LoKr
+
+        # Inject adapter into the decoder
+        attention_type = getattr(training_config, 'attention_type', 'both')
+
+        if adapter_type == "lokr":
+            if not LOKR_IMPORTS_OK or not check_lycoris_available():
+                raise ImportError(
+                    "LyCORIS library is required for LoKr training. "
+                    "Install with: pip install lycoris-lora"
+                )
+            if lokr_config is None:
+                raise ValueError("lokr_config is required when adapter_type='lokr'")
+            self.model, self.lycoris_net, self.lora_info = inject_lokr_into_dit(
+                model, lokr_config, attention_type=attention_type,
+            )
+            logger.info(f"LoKr injected: {self.lora_info['trainable_params']:,} trainable params (attention: {attention_type})")
+        elif check_peft_available():
             self.model, self.lora_info = inject_lora_into_dit(model, lora_config, attention_type=attention_type)
             logger.info(f"LoRA injected: {self.lora_info['trainable_params']:,} trainable params (attention: {attention_type})")
         else:
             self.model = model
             self.lora_info = {}
-            logger.warning("PEFT not available, training without LoRA adapters")
+            logger.warning("No adapter library available, training without adapters")
 
         # Model config for flow matching
         self.config = model.config
@@ -422,18 +454,21 @@ class LoRATrainer:
         dit_handler,
         lora_config: LoRAConfig,
         training_config: TrainingConfig,
+        lokr_config=None,
     ):
         """Initialize the trainer.
-        
+
         Args:
             dit_handler: Initialized DiT handler (for model access)
             lora_config: LoRA configuration
             training_config: Training configuration
+            lokr_config: Optional LoKRConfig for LoKr training
         """
         self.dit_handler = dit_handler
         self.lora_config = lora_config
         self.training_config = training_config
-        
+        self.lokr_config = lokr_config
+
         self.module = None
         self.fabric = None
         self.is_training = False
@@ -483,6 +518,7 @@ class LoRATrainer:
                 training_config=self.training_config,
                 device=self.dit_handler.device,
                 dtype=self.dit_handler.dtype,
+                lokr_config=self.lokr_config,
             )
             
             # Create data module
@@ -518,6 +554,30 @@ class LoRATrainer:
         finally:
             self.is_training = False
     
+    def _save_adapter_weights(self, output_dir: str):
+        """Save adapter weights (LoRA or LoKr) to output_dir."""
+        if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            save_lokr_weights(
+                self.module.lycoris_net, output_dir,
+                lokr_config=self.lokr_config,
+            )
+        else:
+            save_lora_weights(self.module.model, output_dir)
+
+    def _save_adapter_checkpoint(self, optimizer, scheduler, epoch, global_step, output_dir):
+        """Save training checkpoint (LoRA or LoKr) to output_dir."""
+        if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            save_lokr_training_checkpoint(
+                self.module.lycoris_net, optimizer, scheduler,
+                epoch, global_step, output_dir,
+                lokr_config=self.lokr_config,
+            )
+        else:
+            save_training_checkpoint(
+                self.module.model, optimizer, scheduler,
+                epoch, global_step, output_dir,
+            )
+
     def _train_with_fabric(
         self,
         data_module: PreprocessedDataModule,
@@ -561,16 +621,20 @@ class LoRATrainer:
         
         # Get dataloader
         train_loader = data_module.train_dataloader()
-        
-        # Setup optimizer - only LoRA parameters
-        trainable_params = [p for p in self.module.model.parameters() if p.requires_grad]
-        
+
+        # Setup optimizer — get trainable params from the right source
+        if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            trainable_params = list(self.module.lycoris_net.parameters())
+        else:
+            trainable_params = [p for p in self.module.model.parameters() if p.requires_grad]
+
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
             return
-        
-        yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} parameters"
-        
+
+        adapter_label = "LoKr" if self.module.adapter_type == "lokr" else "LoRA"
+        yield 0, 0.0, f"🎯 Training {sum(p.numel() for p in trainable_params):,} {adapter_label} parameters"
+
         optimizer = create_optimizer(trainable_params, self.training_config)
 
         # Calculate total steps
@@ -604,8 +668,15 @@ class LoRATrainer:
         self.module.dtype = train_dtype
         self.module.model = self.module.model.to(train_dtype)
 
-        # Setup with Fabric - only the decoder (which has LoRA)
-        self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
+        # Setup with Fabric
+        # For LoRA: setup the decoder (which contains PEFT wrapper)
+        # For LoKr: setup the lycoris_net (which manages the trainable params)
+        if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            self.module.lycoris_net, optimizer = self.fabric.setup(self.module.lycoris_net, optimizer)
+            # Also move the decoder to the right device/dtype via Fabric
+            self.module.model.decoder = self.fabric.setup_module(self.module.model.decoder)
+        else:
+            self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
 
         # Compile decoder for faster training (after Fabric setup)
         # Off by default: JIT warm-up is very slow on Windows, and variable-length
@@ -734,6 +805,9 @@ class LoRATrainer:
 
         self.module.model.decoder.train()
 
+        # Determine which module Fabric manages for gradient clipping
+        clip_module = self.module.lycoris_net if (self.module.adapter_type == "lokr" and self.module.lycoris_net is not None) else self.module.model.decoder
+
         for epoch in range(start_epoch, self.training_config.max_epochs):
             epoch_loss = 0.0
             num_batches = 0
@@ -757,7 +831,7 @@ class LoRATrainer:
                 # Optimizer step
                 if accumulation_step >= self.training_config.gradient_accumulation_steps:
                     self.fabric.clip_gradients(
-                        self.module.model.decoder,
+                        clip_module,
                         optimizer,
                         max_norm=self.training_config.max_grad_norm,
                     )
@@ -784,7 +858,7 @@ class LoRATrainer:
             # Flush any remaining accumulated gradients at epoch boundary
             if accumulation_step > 0:
                 self.fabric.clip_gradients(
-                    self.module.model.decoder,
+                    clip_module,
                     optimizer,
                     max_norm=self.training_config.max_grad_norm,
                 )
@@ -843,7 +917,7 @@ class LoRATrainer:
             # Auto-save best model (after warmup period)
             if is_new_best:
                 best_path = os.path.join(self.training_config.output_dir, "best")
-                save_lora_weights(self.module.model, best_path)
+                self._save_adapter_weights(best_path)
                 yield global_step, avg_epoch_loss, f"⭐ Best model saved (epoch {epoch+1}, MA5: {best_loss:.4f})"
 
             # Early stopping (only if enabled, and only after warmup period)
@@ -854,22 +928,16 @@ class LoRATrainer:
             # Save checkpoint
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
-                save_training_checkpoint(
-                    self.module.model,
-                    optimizer,
-                    scheduler,
-                    epoch + 1,
-                    global_step,
-                    checkpoint_dir,
-                )
+                self._save_adapter_checkpoint(optimizer, scheduler, epoch + 1, global_step, checkpoint_dir)
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved at epoch {epoch+1}"
 
         # Save final model
         final_path = os.path.join(self.training_config.output_dir, "final")
-        save_lora_weights(self.module.model, final_path)
+        self._save_adapter_weights(final_path)
 
+        adapter_label = "LoKr" if self.module.adapter_type == "lokr" else "LoRA"
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
-        yield global_step, final_loss, f"✅ Training complete! LoRA saved to {final_path} (best loss: {best_loss:.4f} at epoch {best_epoch})"
+        yield global_step, final_loss, f"✅ Training complete! {adapter_label} saved to {final_path} (best loss: {best_loss:.4f} at epoch {best_epoch})"
     
     def _train_basic(
         self,
@@ -894,7 +962,11 @@ class LoRATrainer:
 
         train_loader = data_module.train_dataloader()
 
-        trainable_params = [p for p in self.module.model.parameters() if p.requires_grad]
+        # Get trainable params from the right source
+        if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            trainable_params = list(self.module.lycoris_net.parameters())
+        else:
+            trainable_params = [p for p in self.module.model.parameters() if p.requires_grad]
 
         if not trainable_params:
             yield 0, 0.0, "❌ No trainable parameters found!"
@@ -1124,7 +1196,7 @@ class LoRATrainer:
             # Auto-save best model (after warmup period)
             if is_new_best:
                 best_path = os.path.join(self.training_config.output_dir, "best")
-                save_lora_weights(self.module.model, best_path)
+                self._save_adapter_weights(best_path)
                 yield global_step, avg_epoch_loss, f"⭐ Best model saved (epoch {epoch+1}, MA5: {best_loss:.4f})"
 
             # Early stopping (only if enabled, and only after warmup period)
@@ -1134,13 +1206,15 @@ class LoRATrainer:
 
             if (epoch + 1) % self.training_config.save_every_n_epochs == 0:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
-                save_lora_weights(self.module.model, checkpoint_dir)
+                self._save_adapter_checkpoint(optimizer, scheduler, epoch + 1, global_step, checkpoint_dir)
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved"
 
         final_path = os.path.join(self.training_config.output_dir, "final")
-        save_lora_weights(self.module.model, final_path)
+        self._save_adapter_weights(final_path)
+
+        adapter_label = "LoKr" if self.module.adapter_type == "lokr" else "LoRA"
         final_loss = self.module.training_losses[-1] if self.module.training_losses else 0.0
-        yield global_step, final_loss, f"✅ Training complete! LoRA saved to {final_path} (best loss: {best_loss:.4f} at epoch {best_epoch})"
+        yield global_step, final_loss, f"✅ Training complete! {adapter_label} saved to {final_path} (best loss: {best_loss:.4f} at epoch {best_epoch})"
     
     def stop(self):
         """Stop training."""

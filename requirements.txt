@@ -59,6 +59,10 @@ triton-windows>=3.0.0,<3.4; sys_platform == 'win32'
 triton>=3.0.0; sys_platform != 'win32'
 flash-attn; sys_platform != 'win32'
 
+# --- Optional: LoKr adapter support (via LyCORIS) ---
+# Uncomment if you want LoKr (Low-Rank Kronecker) training as alternative to LoRA:
+# lycoris-lora>=2.0.0
+
 # --- Optional: 8-bit optimizer (saves ~30-40% VRAM) ---
 # Uncomment if you want AdamW 8-bit support:
 # bitsandbytes>=0.43.0; sys_platform != 'darwin'

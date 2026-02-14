@@ -102,6 +102,51 @@ class LoRAConfig:
 
 
 @dataclass
+class LoKRConfig:
+    """Configuration for LoKr (Low-Rank Kronecker) training via LyCORIS.
+
+    LoKr uses Kronecker product factorization as an alternative to standard
+    LoRA low-rank decomposition. Can offer different quality/compression
+    trade-offs depending on the model architecture.
+
+    Requires: pip install lycoris-lora
+
+    Attributes:
+        linear_dim: Dimension for the linear component (similar to LoRA rank).
+                     10000 = let factor determine the effective rank automatically.
+        linear_alpha: Scaling factor (similar to LoRA alpha). 1.0 recommended.
+        factor: Kronecker factor (-1 = auto sqrt of dimension, positive = fixed).
+                Controls the decomposition granularity.
+        decompose_both: Decompose both weight matrices in the Kronecker product.
+                         Can improve quality at cost of more parameters.
+        use_tucker: Use Tucker decomposition for additional compression.
+        dropout: Dropout probability for LoKr layers.
+        target_modules: List of module names to apply LoKr to.
+    """
+    linear_dim: int = 10000  # 10000 = auto (factor determines effective rank)
+    linear_alpha: float = 1.0
+    factor: int = -1  # -1 = auto (sqrt of dimension)
+    decompose_both: bool = False
+    use_tucker: bool = False
+    dropout: float = 0.0
+    target_modules: List[str] = field(default_factory=lambda: [
+        "q_proj", "k_proj", "v_proj", "o_proj"
+    ])
+
+    def to_dict(self):
+        """Convert to dictionary."""
+        return {
+            "linear_dim": self.linear_dim,
+            "linear_alpha": self.linear_alpha,
+            "factor": self.factor,
+            "decompose_both": self.decompose_both,
+            "use_tucker": self.use_tucker,
+            "dropout": self.dropout,
+            "target_modules": self.target_modules,
+        }
+
+
+@dataclass
 class TrainingConfig:
     """Configuration for LoRA training process.
 
@@ -127,6 +172,9 @@ class TrainingConfig:
         seed: Random seed for reproducibility
         output_dir: Directory to save checkpoints and logs
     """
+    # Adapter type: "lora" (PEFT, default) or "lokr" (LyCORIS Kronecker)
+    adapter_type: str = "lora"
+
     # Model type: "turbo" (8 discrete steps, no CFG) or "base" (continuous, with CFG)
     model_type: str = "turbo"
 
@@ -244,6 +292,7 @@ class TrainingConfig:
     def to_dict(self):
         """Convert to dictionary."""
         return {
+            "adapter_type": self.adapter_type,
             "model_type": self.model_type,
             "shift": self.shift,
             "num_inference_steps": self.num_inference_steps,

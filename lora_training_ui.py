@@ -948,6 +948,9 @@ def start_training(
     gradient_checkpointing_flag, encoder_offloading_flag,
     timestep_mu_val, timestep_sigma_val,
     resume_enabled, resume_dir, resume_checkpoint,
+    adapter_type_val,
+    lokr_factor_val, lokr_linear_dim_val, lokr_linear_alpha_val,
+    lokr_decompose_both_val, lokr_use_tucker_val, lokr_dropout_val,
     training_state,
     progress=gr.Progress(),
 ):
@@ -967,11 +970,20 @@ def start_training(
         yield "❌ Initialize service first", "", None, training_state, get_status_html()
         return
 
+    is_lokr = str(adapter_type_val).lower() == "lokr"
+
     try:
         import torch
         torch.set_float32_matmul_precision('medium')
         from lightning.fabric import Fabric
-        from peft import get_peft_model, LoraConfig
+        if is_lokr:
+            try:
+                import lycoris
+            except ImportError:
+                yield "❌ Missing package: lycoris-lora\nInstall with: pip install lycoris-lora", "", None, training_state, get_status_html()
+                return
+        else:
+            from peft import get_peft_model, LoraConfig
     except ImportError as e:
         yield f"❌ Missing packages: {e}\nInstall: pip install peft lightning", "", None, training_state, get_status_html()
         return
@@ -995,11 +1007,25 @@ def start_training(
 
         lora_config = LoRAConfigClass(r=lora_rank, alpha=lora_alpha, dropout=lora_dropout)
 
+        # Create LoKr config if needed
+        lokr_config = None
+        if is_lokr:
+            from acestep.training.configs import LoKRConfig
+            lokr_config = LoKRConfig(
+                linear_dim=int(lokr_linear_dim_val),
+                linear_alpha=float(lokr_linear_alpha_val),
+                factor=int(lokr_factor_val),
+                decompose_both=bool(lokr_decompose_both_val),
+                use_tucker=bool(lokr_use_tucker_val),
+                dropout=float(lokr_dropout_val),
+            )
+
         # Determine model type from UI or global detection
         resolved_model_type = model_type_val if model_type_val else current_model_type
         is_base = resolved_model_type == "base"
 
         training_config = TrainingConfig(
+            adapter_type="lokr" if is_lokr else "lora",
             model_type=resolved_model_type,
             shift=shift,
             learning_rate=learning_rate,
@@ -1032,9 +1058,10 @@ def start_training(
         loss_data = pd.DataFrame({"step": [0], "loss": [0.0]})
         start_time = time.time()
 
+        adapter_label = "LoKr" if is_lokr else "LoRA"
         type_label = "⚡ Turbo" if not is_base else f"🎯 Base (CFG={guidance_scale_val}, steps={num_inference_steps_val})"
         opt_label = optimizer_type_val or "adamw"
-        start_msg = f"🚀 Starting {type_label} training ({opt_label})..."
+        start_msg = f"🚀 Starting {adapter_label} {type_label} training ({opt_label})..."
         if vram_warning:
             start_msg += f"\n{vram_warning}"
         yield start_msg, "", loss_data, training_state, get_status_html()
@@ -1043,6 +1070,7 @@ def start_training(
             dit_handler=dit_handler,
             lora_config=lora_config,
             training_config=training_config,
+            lokr_config=lokr_config,
         )
 
         step_list, loss_list = [], []
@@ -1214,6 +1242,7 @@ def apply_gpu_preset(preset_name):
             gr.update(),  # auto_save_best_after
             gr.update(),  # save_every_n_epochs
             gr.update(),  # max_latent_length
+            gr.update(),  # adapter_type
         )
 
     return (
@@ -1235,6 +1264,7 @@ def apply_gpu_preset(preset_name):
         gr.update(value=preset["auto_save_best_after"]),
         gr.update(value=preset["save_every_n_epochs"]),
         gr.update(value=preset["max_latent_length"]),
+        gr.update(value=preset.get("adapter_type", "LoRA")),
     )
 
 
@@ -1327,8 +1357,21 @@ def export_lora(export_path: str, output_dir: str) -> str:
 
 # ============== LoRA Merge ==============
 
+def _is_valid_adapter_dir(adapter_path: str) -> bool:
+    """Check if a directory contains valid LoRA or LoKr adapter weights."""
+    if not os.path.exists(adapter_path):
+        return False
+    # PEFT LoRA
+    if os.path.exists(os.path.join(adapter_path, "adapter_config.json")):
+        return True
+    # LyCORIS LoKr
+    if os.path.exists(os.path.join(adapter_path, "lokr_config.json")):
+        return True
+    return False
+
+
 def list_lora_checkpoints(output_dir: str) -> List[str]:
-    """List available LoRA checkpoints in an output directory."""
+    """List available LoRA/LoKr checkpoints in an output directory."""
     checkpoints = []
 
     if not output_dir or not os.path.exists(output_dir):
@@ -1336,7 +1379,7 @@ def list_lora_checkpoints(output_dir: str) -> List[str]:
 
     # Check for /final
     final_dir = os.path.join(output_dir, "final", "adapter")
-    if os.path.exists(final_dir) and os.path.exists(os.path.join(final_dir, "adapter_config.json")):
+    if _is_valid_adapter_dir(final_dir):
         checkpoints.append(f"final")
 
     # Check numbered epoch checkpoints
@@ -1345,7 +1388,7 @@ def list_lora_checkpoints(output_dir: str) -> List[str]:
         for d in sorted(os.listdir(ckpt_dir)):
             if d.startswith("epoch_"):
                 adapter_path = os.path.join(ckpt_dir, d, "adapter")
-                if os.path.exists(adapter_path) and os.path.exists(os.path.join(adapter_path, "adapter_config.json")):
+                if _is_valid_adapter_dir(adapter_path):
                     checkpoints.append(f"checkpoints/{d}")
 
     return checkpoints
@@ -1403,15 +1446,18 @@ def merge_lora_to_safetensors(
     if not os.path.exists(adapter_path):
         # Maybe it's the directory itself (no "adapter" subfolder)
         adapter_path = os.path.join(lora_dir, lora_checkpoint)
-    adapter_config = os.path.join(adapter_path, "adapter_config.json")
-    if not os.path.exists(adapter_config):
-        return f"❌ adapter_config.json not found in {adapter_path}"
+
+    # Detect adapter type
+    is_lokr_checkpoint = os.path.exists(os.path.join(adapter_path, "lokr_config.json"))
+    is_peft_checkpoint = os.path.exists(os.path.join(adapter_path, "adapter_config.json"))
+
+    if not is_lokr_checkpoint and not is_peft_checkpoint:
+        return f"❌ No adapter config found in {adapter_path}. Expected adapter_config.json (LoRA) or lokr_config.json (LoKr)."
 
     try:
         progress(0.05, desc="Importing libraries...")
         import torch
         from transformers import AutoModel
-        from peft import PeftModel
 
         # Step 1: Load base model
         progress(0.1, desc="Loading base model (this takes a moment)...")
@@ -1426,20 +1472,48 @@ def merge_lora_to_safetensors(
         base_model = base_model.to("cpu").to(torch.bfloat16)
         base_model.eval()
 
-        progress(0.4, desc="Loading LoRA adapter...")
-        logger.info(f"[merge] Loading LoRA adapter from {adapter_path}")
+        if is_lokr_checkpoint:
+            # LoKr merge via LyCORIS
+            try:
+                from lycoris import create_lycoris_from_weights
+            except ImportError:
+                return "❌ lycoris-lora is required to merge LoKr checkpoints. Install: pip install lycoris-lora"
 
-        # Step 2: Apply LoRA adapter to the decoder
-        base_model.decoder = PeftModel.from_pretrained(
-            base_model.decoder,
-            adapter_path,
-        )
+            lokr_weights_path = os.path.join(adapter_path, "lokr_weights.safetensors")
+            if not os.path.exists(lokr_weights_path):
+                return f"❌ lokr_weights.safetensors not found in {adapter_path}"
 
-        progress(0.6, desc="Merging LoRA weights into base model...")
-        logger.info("[merge] Merging LoRA weights...")
+            progress(0.4, desc="Loading LoKr adapter...")
+            logger.info(f"[merge] Loading LoKr adapter from {lokr_weights_path}")
 
-        # Step 3: Merge and unload — permanently integrates LoRA into weights
-        base_model.decoder = base_model.decoder.merge_and_unload()
+            lycoris_net, _ = create_lycoris_from_weights(
+                1.0, lokr_weights_path, base_model.decoder,
+            )
+            lycoris_net.apply_to()
+            lycoris_net.load_weights(lokr_weights_path)
+
+            progress(0.6, desc="Merging LoKr weights into base model...")
+            logger.info("[merge] Merging LoKr weights...")
+            lycoris_net.merge_to(1.0)
+
+        else:
+            # PEFT LoRA merge
+            from peft import PeftModel
+
+            progress(0.4, desc="Loading LoRA adapter...")
+            logger.info(f"[merge] Loading LoRA adapter from {adapter_path}")
+
+            # Step 2: Apply LoRA adapter to the decoder
+            base_model.decoder = PeftModel.from_pretrained(
+                base_model.decoder,
+                adapter_path,
+            )
+
+            progress(0.6, desc="Merging LoRA weights into base model...")
+            logger.info("[merge] Merging LoRA weights...")
+
+            # Step 3: Merge and unload — permanently integrates LoRA into weights
+            base_model.decoder = base_model.decoder.merge_and_unload()
 
         progress(0.75, desc="Saving merged model as safetensors...")
         logger.info(f"[merge] Saving merged model to {merge_output_dir}")
@@ -1471,7 +1545,7 @@ def merge_lora_to_safetensors(
             return (
                 f"✅ Merged model saved to {merge_output_dir}\n"
                 f"   model.safetensors: {size_gb:.1f} GB\n"
-                f"   Base: {checkpoint_name} + LoRA: {lora_checkpoint}\n"
+                f"   Base: {checkpoint_name} + {'LoKr' if is_lokr_checkpoint else 'LoRA'}: {lora_checkpoint}\n"
                 f"   Ready for ComfyUI or direct inference!"
             )
         else:
@@ -1483,7 +1557,7 @@ def merge_lora_to_safetensors(
                 return (
                     f"✅ Merged model saved to {merge_output_dir}\n"
                     f"   {len(shards)} shard(s), total: {total_size:.1f} GB\n"
-                    f"   Base: {checkpoint_name} + LoRA: {lora_checkpoint}\n"
+                    f"   Base: {checkpoint_name} + {'LoKr' if is_lokr_checkpoint else 'LoRA'}: {lora_checkpoint}\n"
                     f"   Ready for ComfyUI or direct inference!"
                 )
             return f"⚠️ Model saved but safetensors not found in {merge_output_dir}"
@@ -1857,11 +1931,31 @@ def create_ui():
                     load_tensors_btn = gr.Button("📂 Load", variant="secondary", size="sm")
                     training_dataset_info = gr.Textbox(label="Dataset Info", interactive=False, lines=2)
 
-                    gr.HTML('<div class="section-title" style="margin-top:15px">⚙️ LoRA Settings</div>')
+                    gr.HTML('<div class="section-title" style="margin-top:15px">⚙️ Adapter Settings</div>')
 
-                    lora_rank = gr.Slider(4, 256, 64, step=4, label="Rank (r)", info="64 recommended (32 for low VRAM)")
-                    lora_alpha = gr.Slider(4, 512, 128, step=4, label="Alpha", info="2x rank (α/r=2.0) recommended")
-                    lora_dropout = gr.Slider(0.0, 0.5, 0.1, step=0.05, label="Dropout")
+                    adapter_type = gr.Radio(
+                        choices=["LoRA", "LoKr"],
+                        value="LoRA",
+                        label="Adapter Type",
+                        info="LoRA (PEFT, default) or LoKr (LyCORIS, Kronecker factorization — requires lycoris-lora)",
+                    )
+
+                    # LoRA settings (visible by default)
+                    lora_settings_group = gr.Group(visible=True)
+                    with lora_settings_group:
+                        lora_rank = gr.Slider(4, 256, 64, step=4, label="Rank (r)", info="64 recommended (32 for low VRAM)")
+                        lora_alpha = gr.Slider(4, 512, 128, step=4, label="Alpha", info="2x rank (α/r=2.0) recommended")
+                        lora_dropout = gr.Slider(0.0, 0.5, 0.1, step=0.05, label="Dropout")
+
+                    # LoKr settings (hidden by default)
+                    lokr_settings_group = gr.Group(visible=False)
+                    with lokr_settings_group:
+                        lokr_factor = gr.Slider(-1, 64, -1, step=1, label="Factor", info="-1 = auto (sqrt of dim). Controls Kronecker decomposition granularity.")
+                        lokr_linear_dim = gr.Slider(1, 10000, 10000, step=1, label="Linear Dim", info="10000 = auto (factor determines effective rank). Lower = fewer params.")
+                        lokr_linear_alpha = gr.Slider(0.1, 10.0, 1.0, step=0.1, label="Linear Alpha", info="Scaling factor. 1.0 recommended.")
+                        lokr_decompose_both = gr.Checkbox(label="Decompose Both", value=False, info="Decompose both matrices in Kronecker product. More params, potentially better quality.")
+                        lokr_use_tucker = gr.Checkbox(label="Use Tucker Decomposition", value=False, info="Additional Tucker decomposition for more compression.")
+                        lokr_dropout = gr.Slider(0.0, 0.5, 0.0, step=0.05, label="Dropout")
 
                 # Right: Training Params
                 with gr.Column(scale=1):
@@ -2150,6 +2244,19 @@ def create_ui():
             inputs=[resume_dir],
             outputs=[resume_checkpoint_dropdown, resume_scan_status],
         )
+        # Adapter type toggle (show/hide LoRA vs LoKr settings)
+        def toggle_adapter_settings(adapter_choice):
+            if adapter_choice == "LoKr":
+                return gr.update(visible=False), gr.update(visible=True)
+            else:
+                return gr.update(visible=True), gr.update(visible=False)
+
+        adapter_type.change(
+            fn=toggle_adapter_settings,
+            inputs=[adapter_type],
+            outputs=[lora_settings_group, lokr_settings_group],
+        )
+
         # GPU Presets
         gpu_preset.change(
             fn=apply_gpu_preset,
@@ -2161,6 +2268,7 @@ def create_ui():
                 gradient_checkpointing_enabled, encoder_offloading_enabled, torch_compile_enabled,
                 early_stop_enabled, early_stop_patience_val, auto_save_best_after,
                 save_every_n_epochs, max_latent_length,
+                adapter_type,
             ],
         )
 
@@ -2174,7 +2282,22 @@ def create_ui():
 
         start_training_btn.click(
             fn=start_training,
-            inputs=[training_tensor_dir, lora_rank, lora_alpha, lora_dropout, learning_rate, max_epochs, batch_size, gradient_accumulation, save_every_n_epochs, shift, seed, lora_output_dir, early_stop_enabled, early_stop_patience_val, auto_save_best_after, max_latent_length, torch_compile_enabled, model_type_radio, guidance_scale, cfg_dropout_prob, num_inference_steps, optimizer_type, scheduler_type, attention_type, gradient_checkpointing_enabled, encoder_offloading_enabled, timestep_mu, timestep_sigma, resume_enabled, resume_dir, resume_checkpoint_dropdown, training_state],
+            inputs=[
+                training_tensor_dir, lora_rank, lora_alpha, lora_dropout,
+                learning_rate, max_epochs, batch_size, gradient_accumulation,
+                save_every_n_epochs, shift, seed, lora_output_dir,
+                early_stop_enabled, early_stop_patience_val, auto_save_best_after,
+                max_latent_length, torch_compile_enabled,
+                model_type_radio, guidance_scale, cfg_dropout_prob, num_inference_steps,
+                optimizer_type, scheduler_type, attention_type,
+                gradient_checkpointing_enabled, encoder_offloading_enabled,
+                timestep_mu, timestep_sigma,
+                resume_enabled, resume_dir, resume_checkpoint_dropdown,
+                adapter_type,
+                lokr_factor, lokr_linear_dim, lokr_linear_alpha,
+                lokr_decompose_both, lokr_use_tucker, lokr_dropout,
+                training_state,
+            ],
             outputs=[training_progress, training_log, training_loss_plot, training_state, status_bar],
         )
         stop_training_btn.click(fn=stop_training, inputs=[training_state], outputs=[training_progress, training_state])
