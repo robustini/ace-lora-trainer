@@ -55,9 +55,18 @@ def get_checkpoints_dir() -> Path:
     return ACESTEP_PATH / "checkpoints"
 
 
-def _get_all_checkpoint_dirs() -> List[Path]:
-    """Return all directories that may contain base-model checkpoints."""
+def _get_all_checkpoint_dirs(custom_dir: str = "") -> List[Path]:
+    """Return all directories that may contain base-model checkpoints.
+
+    Args:
+        custom_dir: Optional user-specified directory to include in the scan.
+    """
     dirs = []
+    # Custom directory first (highest priority)
+    if custom_dir and custom_dir.strip():
+        p = Path(custom_dir.strip())
+        if p.exists() and p.is_dir():
+            dirs.append(p)
     for sub in ["ACE-Step-1.5/checkpoints", "checkpoints"]:
         p = ACESTEP_PATH / sub
         if p.exists():
@@ -65,19 +74,22 @@ def _get_all_checkpoint_dirs() -> List[Path]:
     return dirs
 
 
-def list_available_checkpoints() -> List[str]:
+def list_available_checkpoints(custom_dir: str = "") -> List[str]:
     """List available model checkpoints that start with 'acestep-v15-'.
 
-    Scans all known checkpoint directories and deduplicates by name.
+    Scans all known checkpoint directories (+ optional custom dir) and
+    deduplicates by name. Entries from custom_dir are prefixed with the
+    absolute path so we can distinguish them at load time.
     """
-    seen = set()
-    checkpoints = []
-    for ckpt_dir in _get_all_checkpoint_dirs():
+    seen_names: set = set()
+    checkpoints: List[str] = []
+
+    for ckpt_dir in _get_all_checkpoint_dirs(custom_dir):
         try:
             for item in ckpt_dir.iterdir():
                 if item.is_dir() and item.name.startswith("acestep-v15-"):
-                    if (item / "config.json").exists() and item.name not in seen:
-                        seen.add(item.name)
+                    if (item / "config.json").exists() and item.name not in seen_names:
+                        seen_names.add(item.name)
                         checkpoints.append(item.name)
         except OSError:
             continue
@@ -85,12 +97,13 @@ def list_available_checkpoints() -> List[str]:
     return sorted(checkpoints)
 
 
-def resolve_checkpoint_path(checkpoint_name: str) -> Path:
+def resolve_checkpoint_path(checkpoint_name: str, custom_dir: str = "") -> Path:
     """Resolve a checkpoint name to its full path.
 
-    Searches all known checkpoint directories for the given name.
+    Searches all known checkpoint directories (+ optional custom dir) for
+    the given name.
     """
-    for ckpt_dir in _get_all_checkpoint_dirs():
+    for ckpt_dir in _get_all_checkpoint_dirs(custom_dir):
         candidate = ckpt_dir / checkpoint_name
         if candidate.exists():
             return candidate
@@ -197,7 +210,7 @@ def _detect_model_type(checkpoint_name: str) -> str:
     return "turbo"
 
 
-def initialize_service(checkpoint_name: str, progress=gr.Progress()):
+def initialize_service(checkpoint_name: str, custom_ckpt_dir: str = "", progress=gr.Progress()):
     """Initialize ACE-Step service. Returns status + auto-detected model type params."""
     global dit_handler, llm_handler, workflow_state, current_model_type
 
@@ -233,6 +246,15 @@ def initialize_service(checkpoint_name: str, progress=gr.Progress()):
 
         if not success:
             return f"❌ Failed to initialize DiT: {status}", get_status_html(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+
+        # If the user specified a custom checkpoints folder, check whether the
+        # selected model lives there and override the handler's checkpoint_dir
+        # so _load_dit() resolves the right path.
+        custom_dir = (custom_ckpt_dir or "").strip()
+        if custom_dir:
+            resolved = resolve_checkpoint_path(checkpoint_name, custom_dir)
+            if resolved.exists():
+                dit_handler._init_params["checkpoint_dir"] = str(resolved.parent)
 
         # Load only DiT model (skip VAE + text_encoder to save ~3GB VRAM for training)
         progress(0.5, desc="Loading DiT model...")
@@ -1751,6 +1773,15 @@ def create_ui():
                     gr.HTML('<div class="section-title">🔧 Model Configuration</div>')
 
                     with gr.Row(elem_classes="compact-row"):
+                        custom_ckpt_dir = gr.Textbox(
+                            label="Checkpoints Folder (optional)",
+                            info="Custom folder with acestep-v15-* models. Leave empty for default.",
+                            placeholder="e.g. D:\\models\\checkpoints",
+                            scale=3,
+                        )
+                        custom_ckpt_browse = gr.Button("📂", scale=0, min_width=50)
+
+                    with gr.Row(elem_classes="compact-row"):
                         checkpoint_dropdown = gr.Dropdown(
                             choices=list_available_checkpoints(),
                             label="Model Checkpoint",
@@ -2231,8 +2262,19 @@ def create_ui():
         export_path_picker.click(fn=open_folder_picker, outputs=[export_path])
 
         # Service
-        refresh_btn.click(fn=lambda: gr.Dropdown(choices=list_available_checkpoints()), outputs=[checkpoint_dropdown])
-        init_btn.click(fn=initialize_service, inputs=[checkpoint_dropdown], outputs=[service_status, status_bar, shift, model_type_radio, guidance_scale, num_inference_steps, base_params_group])
+        custom_ckpt_browse.click(fn=open_folder_picker, outputs=[custom_ckpt_dir])
+        # When custom dir changes, refresh the checkpoint dropdown to include models from that folder
+        custom_ckpt_dir.change(
+            fn=lambda d: gr.Dropdown(choices=list_available_checkpoints(d)),
+            inputs=[custom_ckpt_dir],
+            outputs=[checkpoint_dropdown],
+        )
+        refresh_btn.click(
+            fn=lambda d: gr.Dropdown(choices=list_available_checkpoints(d)),
+            inputs=[custom_ckpt_dir],
+            outputs=[checkpoint_dropdown],
+        )
+        init_btn.click(fn=initialize_service, inputs=[checkpoint_dropdown, custom_ckpt_dir], outputs=[service_status, status_bar, shift, model_type_radio, guidance_scale, num_inference_steps, base_params_group])
         unload_btn.click(fn=unload_service, outputs=[service_status, status_bar])
 
         # Dataset

@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-02-15c — Custom Checkpoints Folder
+
+Added the ability to select a custom folder for model checkpoints in the Service tab.
+
+- **New "Checkpoints Folder" field** — Textbox + browse button (`📂`) above the model dropdown. Point it to any folder containing `acestep-v15-*` model directories.
+- **Auto-refresh** — Changing the folder automatically rescans and updates the Model Checkpoint dropdown.
+- **Refresh button** now also respects the custom folder when rescanning.
+- **`initialize_service()`** — Resolves the selected model from the custom folder and overrides the handler's checkpoint dir so `_load_dit()` finds it correctly.
+- Leave the field empty to use the default `checkpoints/` locations as before.
+
+---
+
 ## 2026-02-15b — LoKr Training Speed Fix + lycoris-lora Required
 
 ### Critical Fix: LoKr Training 10-50x Slower Than LoRA
