@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-02-15 — Lazy/On-Demand Model Loading
+
+Reduced idle VRAM usage and startup time by loading models only when needed.
+
+- **`initialize_service(lazy=True)`** — new mode that stores config and downloads models but defers weight loading. The server/UI is ready immediately.
+- **`ensure_models_loaded()`** — thread-safe lazy loader that loads all models (DiT + VAE + text encoder) on first generation request. Uses double-check locking for safe concurrent access.
+- **`ensure_dit_loaded()`** — loads only the DiT model for training workflows, skipping VAE and text encoder (~3GB VRAM saved).
+- **Training UI** now calls `ensure_dit_loaded()` instead of loading all models — VAE and text encoder are never used during training.
+- **`generate_music()`** auto-triggers `ensure_models_loaded()` if models aren't loaded yet.
+- **Pinokio API server** uses lazy init for all DiT handlers (primary + secondary + tertiary) — server starts in <5s instead of 30-120s. `/health` endpoint now reports `models_loaded` and `llm_loaded` status.
+
+---
+
 ## 2026-02-14b — LoKr Support, Upstream Optimizations & Bug Fixes
 
 ### LoKr (Low-Rank Kronecker) Training Support
