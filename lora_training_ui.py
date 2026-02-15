@@ -219,6 +219,7 @@ def initialize_service(checkpoint_name: str, progress=gr.Progress()):
         project_root = str(ACESTEP_PATH)
 
         progress(0.3, desc=f"Loading model: {checkpoint_name}...")
+        # Use lazy init: download models but only load DiT (training doesn't need VAE/text_encoder)
         status, success = dit_handler.initialize_service(
             project_root=project_root,
             config_path=checkpoint_name,
@@ -227,10 +228,15 @@ def initialize_service(checkpoint_name: str, progress=gr.Progress()):
             compile_model=False,
             offload_to_cpu=False,
             offload_dit_to_cpu=False,
+            lazy=True,  # Defer weight loading
         )
 
         if not success:
             return f"❌ Failed to initialize DiT: {status}", get_status_html(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+
+        # Load only DiT model (skip VAE + text_encoder to save ~3GB VRAM for training)
+        progress(0.5, desc="Loading DiT model...")
+        dit_handler.ensure_dit_loaded()
 
         progress(0.7, desc="Initializing LLM handler...")
         checkpoint_dir = str(get_checkpoints_dir())

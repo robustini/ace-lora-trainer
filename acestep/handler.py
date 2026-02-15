@@ -10,6 +10,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import math
 from copy import deepcopy
 import tempfile
+import threading
 import traceback
 import re
 import random
@@ -89,6 +90,12 @@ class AceStepHandler:
         self.lora_scale = 1.0  # LoRA influence scale (0-1)
         self._base_decoder = None  # CPU state_dict backup (memory-efficient vs deepcopy)
         self._lora_path = None  # Path of currently loaded LoRA
+
+        # Lazy loading state
+        self._models_loaded = False
+        self._dit_loaded = False  # True when DiT is loaded (for training-only mode)
+        self._load_lock = threading.Lock()
+        self._init_params = {}  # Stores config for deferred model loading
     
     def get_available_checkpoints(self) -> str:
         """Return project root directory path"""
@@ -439,9 +446,14 @@ class AceStepHandler:
         offload_dit_to_cpu: bool = False,
         quantization: Optional[str] = None,
         prefer_source: Optional[str] = None,
+        lazy: bool = False,
     ) -> Tuple[str, bool]:
         """
-        Initialize DiT model service
+        Initialize DiT model service.
+
+        When lazy=False (default), behaves as before: downloads + loads all models.
+        When lazy=True, only stores config and downloads models, but defers weight
+        loading to the first call to ensure_models_loaded() or ensure_dit_loaded().
 
         Args:
             project_root: Project root path (may be checkpoints directory, will be handled automatically)
@@ -452,6 +464,7 @@ class AceStepHandler:
             offload_to_cpu: Whether to offload models to CPU when not in use
             offload_dit_to_cpu: Whether to offload DiT model to CPU when not in use (only effective if offload_to_cpu is True)
             prefer_source: Preferred download source ("huggingface", "modelscope", or None for auto-detect)
+            lazy: If True, defer model weight loading until first use
 
         Returns:
             (status_message, enable_generate_button)
@@ -467,8 +480,6 @@ class AceStepHandler:
                 else:
                     device = "cpu"
 
-            status_msg = ""
-            
             self.device = device
             self.offload_to_cpu = offload_to_cpu
             self.offload_dit_to_cpu = offload_dit_to_cpu
@@ -481,7 +492,7 @@ class AceStepHandler:
                     import torchao
                 except ImportError:
                     raise ImportError("torchao is required for quantization but is not installed. Please install torchao to use quantization features.")
-                
+
 
             # Auto-detect project root (independent of passed project_root parameter)
             actual_project_root = self._get_project_root()
@@ -490,7 +501,7 @@ class AceStepHandler:
             # Auto-download models if not present
             from pathlib import Path
             checkpoint_path = Path(checkpoint_dir)
-            
+
             # Check and download main model components (vae, text_encoder, default DiT)
             if not check_main_model_exists(checkpoint_path):
                 logger.info("[initialize_service] Main model not found, starting auto-download...")
@@ -507,150 +518,199 @@ class AceStepHandler:
                     return f"❌ Failed to download DiT model '{config_path}': {msg}", False
                 logger.info(f"[initialize_service] {msg}")
 
-            # 1. Load main model
-            # config_path is relative path (e.g., "acestep-v15-turbo"), concatenate to checkpoints directory
-            acestep_v15_checkpoint_path = os.path.join(checkpoint_dir, config_path)
-            if os.path.exists(acestep_v15_checkpoint_path):
-                # Determine attention implementation
-                if use_flash_attention and self.is_flash_attention_available():
-                    attn_implementation = "flash_attention_2"
-                    self.dtype = torch.bfloat16
-                else:
-                    attn_implementation = "sdpa"
+            # Store params for deferred loading
+            self._init_params = {
+                "checkpoint_dir": checkpoint_dir,
+                "config_path": config_path,
+                "use_flash_attention": use_flash_attention,
+                "compile_model": compile_model,
+            }
 
-                try:
-                    logger.info(f"[initialize_service] Attempting to load model with attention implementation: {attn_implementation}")
-                    self.model = AutoModel.from_pretrained(
-                        acestep_v15_checkpoint_path, 
-                        trust_remote_code=True, 
-                        attn_implementation=attn_implementation,
-                        dtype="bfloat16"
-                    )
-                except Exception as e:
-                    logger.warning(f"[initialize_service] Failed to load model with {attn_implementation}: {e}")
-                    if attn_implementation == "sdpa":
-                        logger.info("[initialize_service] Falling back to eager attention")
-                        attn_implementation = "eager"
-                        self.model = AutoModel.from_pretrained(
-                            acestep_v15_checkpoint_path, 
-                            trust_remote_code=True, 
-                            attn_implementation=attn_implementation
-                        )
-                    else:
-                        raise e
+            if lazy:
+                logger.info("[initialize_service] Lazy mode: config stored, models will load on first use")
+                return f"✅ Service configured (lazy) on {device} — models load on first request", True
 
-                self.model.config._attn_implementation = attn_implementation
-                self.config = self.model.config
-                # Move model to device and set dtype
-                if not self.offload_to_cpu:
-                    self.model = self.model.to(device).to(self.dtype)
-                else:
-                    # If offload_to_cpu is True, check if we should keep DiT on GPU
-                    if not self.offload_dit_to_cpu:
-                        logger.info(f"[initialize_service] Keeping main model on {device} (persistent)")
-                        self.model = self.model.to(device).to(self.dtype)
-                    else:
-                        self.model = self.model.to("cpu").to(self.dtype)
-                self.model.eval()
-                
-                if compile_model:
-                    # Add __len__ method to model to support torch.compile
-                    # torch.compile's dynamo requires this method for introspection
-                    # Note: This modifies the model class, affecting all instances
-                    if not hasattr(self.model.__class__, '__len__'):
-                        def _model_len(model_self):
-                            """Return 0 as default length for torch.compile compatibility"""
-                            return 0
-                        self.model.__class__.__len__ = _model_len
-                    
-                    self.model = torch.compile(self.model)
-                    
-                    if self.quantization is not None:
-                        from torchao.quantization import quantize_
-                        if self.quantization == "int8_weight_only":
-                            from torchao.quantization import Int8WeightOnlyConfig
-                            quant_config = Int8WeightOnlyConfig()
-                        elif self.quantization == "fp8_weight_only":
-                            from torchao.quantization import Float8WeightOnlyConfig
-                            quant_config = Float8WeightOnlyConfig()
-                        elif self.quantization == "w8a8_dynamic":
-                            from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
-                            quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
-                        else:
-                            raise ValueError(f"Unsupported quantization type: {self.quantization}")
-                        
-                        quantize_(self.model, quant_config)
-                        logger.info(f"[initialize_service] DiT quantized with: {self.quantization}")
-                    
-                    
-                silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
-                if os.path.exists(silence_latent_path):
-                    self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
-                    # Always keep silence_latent on GPU - it's used in many places outside model context
-                    # and is small enough that it won't significantly impact VRAM
-                    self.silence_latent = self.silence_latent.to(device).to(self.dtype)
-                else:
-                    raise FileNotFoundError(f"Silence latent not found at {silence_latent_path}")
-            else:
-                raise FileNotFoundError(f"ACE-Step V1.5 checkpoint not found at {acestep_v15_checkpoint_path}")
-            
-            # 2. Load VAE
-            vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
-            if os.path.exists(vae_checkpoint_path):
-                self.vae = AutoencoderOobleck.from_pretrained(vae_checkpoint_path)
-                # Use bfloat16 for VAE on GPU, otherwise use self.dtype (float32 on CPU)
-                vae_dtype = self._get_vae_dtype(device)
-                if not self.offload_to_cpu:
-                    self.vae = self.vae.to(device).to(vae_dtype)
-                else:
-                    self.vae = self.vae.to("cpu").to(vae_dtype)
-                self.vae.eval()
-            else:
-                raise FileNotFoundError(f"VAE checkpoint not found at {vae_checkpoint_path}")
+            # Eager mode: load everything now
+            self._load_dit()
+            self._load_vae_and_text_encoder()
+            self._models_loaded = True
 
-            if compile_model:
-                # Add __len__ method to VAE to support torch.compile if needed
-                # Note: This modifies the VAE class, affecting all instances
-                if not hasattr(self.vae.__class__, '__len__'):
-                    def _vae_len(vae_self):
-                        """Return 0 as default length for torch.compile compatibility"""
-                        return 0
-                    self.vae.__class__.__len__ = _vae_len
-                
-                self.vae = torch.compile(self.vae)
-            
-            # 3. Load text encoder and tokenizer
-            text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
-            if os.path.exists(text_encoder_path):
-                self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
-                self.text_encoder = AutoModel.from_pretrained(text_encoder_path)
-                if not self.offload_to_cpu:
-                    self.text_encoder = self.text_encoder.to(device).to(self.dtype)
-                else:
-                    self.text_encoder = self.text_encoder.to("cpu").to(self.dtype)
-                self.text_encoder.eval()
-            else:
-                raise FileNotFoundError(f"Text encoder not found at {text_encoder_path}")
-
-            # Determine actual attention implementation used
             actual_attn = getattr(self.config, "_attn_implementation", "eager")
-            
+            dit_path = os.path.join(checkpoint_dir, config_path)
+
             status_msg = f"✅ Model initialized successfully on {device}\n"
-            status_msg += f"Main model: {acestep_v15_checkpoint_path}\n"
-            status_msg += f"VAE: {vae_checkpoint_path}\n"
-            status_msg += f"Text encoder: {text_encoder_path}\n"
+            status_msg += f"Main model: {dit_path}\n"
+            status_msg += f"VAE: {os.path.join(checkpoint_dir, 'vae')}\n"
+            status_msg += f"Text encoder: {os.path.join(checkpoint_dir, 'Qwen3-Embedding-0.6B')}\n"
             status_msg += f"Dtype: {self.dtype}\n"
             status_msg += f"Attention: {actual_attn}\n"
             status_msg += f"Compiled: {compile_model}\n"
             status_msg += f"Offload to CPU: {self.offload_to_cpu}\n"
             status_msg += f"Offload DiT to CPU: {self.offload_dit_to_cpu}"
-            
+
             return status_msg, True
-            
+
         except Exception as e:
             error_msg = f"❌ Error initializing model: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.exception("[initialize_service] Error initializing model")
             return error_msg, False
+
+    def _load_dit(self):
+        """Load DiT model and silence latent into memory."""
+        p = self._init_params
+        checkpoint_dir = p["checkpoint_dir"]
+        config_path = p["config_path"]
+        use_flash_attention = p["use_flash_attention"]
+        compile_model = p["compile_model"]
+        device = self.device
+
+        acestep_v15_checkpoint_path = os.path.join(checkpoint_dir, config_path)
+        if not os.path.exists(acestep_v15_checkpoint_path):
+            raise FileNotFoundError(f"ACE-Step V1.5 checkpoint not found at {acestep_v15_checkpoint_path}")
+
+        # Determine attention implementation
+        if use_flash_attention and self.is_flash_attention_available():
+            attn_implementation = "flash_attention_2"
+            self.dtype = torch.bfloat16
+        else:
+            attn_implementation = "sdpa"
+
+        try:
+            logger.info(f"[_load_dit] Loading model with attention: {attn_implementation}")
+            self.model = AutoModel.from_pretrained(
+                acestep_v15_checkpoint_path,
+                trust_remote_code=True,
+                attn_implementation=attn_implementation,
+                dtype="bfloat16"
+            )
+        except Exception as e:
+            logger.warning(f"[_load_dit] Failed with {attn_implementation}: {e}")
+            if attn_implementation == "sdpa":
+                logger.info("[_load_dit] Falling back to eager attention")
+                attn_implementation = "eager"
+                self.model = AutoModel.from_pretrained(
+                    acestep_v15_checkpoint_path,
+                    trust_remote_code=True,
+                    attn_implementation=attn_implementation
+                )
+            else:
+                raise e
+
+        self.model.config._attn_implementation = attn_implementation
+        self.config = self.model.config
+        # Move model to device and set dtype
+        if not self.offload_to_cpu:
+            self.model = self.model.to(device).to(self.dtype)
+        else:
+            if not self.offload_dit_to_cpu:
+                logger.info(f"[_load_dit] Keeping main model on {device} (persistent)")
+                self.model = self.model.to(device).to(self.dtype)
+            else:
+                self.model = self.model.to("cpu").to(self.dtype)
+        self.model.eval()
+
+        if compile_model:
+            if not hasattr(self.model.__class__, '__len__'):
+                def _model_len(model_self):
+                    return 0
+                self.model.__class__.__len__ = _model_len
+
+            self.model = torch.compile(self.model)
+
+            if self.quantization is not None:
+                from torchao.quantization import quantize_
+                if self.quantization == "int8_weight_only":
+                    from torchao.quantization import Int8WeightOnlyConfig
+                    quant_config = Int8WeightOnlyConfig()
+                elif self.quantization == "fp8_weight_only":
+                    from torchao.quantization import Float8WeightOnlyConfig
+                    quant_config = Float8WeightOnlyConfig()
+                elif self.quantization == "w8a8_dynamic":
+                    from torchao.quantization import Int8DynamicActivationInt8WeightConfig, MappingType
+                    quant_config = Int8DynamicActivationInt8WeightConfig(act_mapping_type=MappingType.ASYMMETRIC)
+                else:
+                    raise ValueError(f"Unsupported quantization type: {self.quantization}")
+
+                quantize_(self.model, quant_config)
+                logger.info(f"[_load_dit] DiT quantized with: {self.quantization}")
+
+
+        silence_latent_path = os.path.join(acestep_v15_checkpoint_path, "silence_latent.pt")
+        if os.path.exists(silence_latent_path):
+            self.silence_latent = torch.load(silence_latent_path).transpose(1, 2)
+            self.silence_latent = self.silence_latent.to(device).to(self.dtype)
+        else:
+            raise FileNotFoundError(f"Silence latent not found at {silence_latent_path}")
+
+        self._dit_loaded = True
+        logger.info(f"[_load_dit] DiT loaded on {device}")
+
+    def _load_vae_and_text_encoder(self):
+        """Load VAE and text encoder into memory."""
+        p = self._init_params
+        checkpoint_dir = p["checkpoint_dir"]
+        compile_model = p["compile_model"]
+        device = self.device
+
+        # Load VAE
+        vae_checkpoint_path = os.path.join(checkpoint_dir, "vae")
+        if not os.path.exists(vae_checkpoint_path):
+            raise FileNotFoundError(f"VAE checkpoint not found at {vae_checkpoint_path}")
+
+        self.vae = AutoencoderOobleck.from_pretrained(vae_checkpoint_path)
+        vae_dtype = self._get_vae_dtype(device)
+        if not self.offload_to_cpu:
+            self.vae = self.vae.to(device).to(vae_dtype)
+        else:
+            self.vae = self.vae.to("cpu").to(vae_dtype)
+        self.vae.eval()
+
+        if compile_model:
+            if not hasattr(self.vae.__class__, '__len__'):
+                def _vae_len(vae_self):
+                    return 0
+                self.vae.__class__.__len__ = _vae_len
+            self.vae = torch.compile(self.vae)
+
+        # Load text encoder and tokenizer
+        text_encoder_path = os.path.join(checkpoint_dir, "Qwen3-Embedding-0.6B")
+        if not os.path.exists(text_encoder_path):
+            raise FileNotFoundError(f"Text encoder not found at {text_encoder_path}")
+
+        self.text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_path)
+        self.text_encoder = AutoModel.from_pretrained(text_encoder_path)
+        if not self.offload_to_cpu:
+            self.text_encoder = self.text_encoder.to(device).to(self.dtype)
+        else:
+            self.text_encoder = self.text_encoder.to("cpu").to(self.dtype)
+        self.text_encoder.eval()
+
+        logger.info(f"[_load_vae_and_text_encoder] VAE + text encoder loaded on {device}")
+
+    def ensure_models_loaded(self):
+        """Thread-safe lazy loader: loads ALL models (DiT + VAE + text encoder) if not already loaded."""
+        if self._models_loaded:
+            return
+        with self._load_lock:
+            if self._models_loaded:
+                return
+            logger.info("[ensure_models_loaded] Loading all models on first use...")
+            if not self._dit_loaded:
+                self._load_dit()
+            self._load_vae_and_text_encoder()
+            self._models_loaded = True
+            logger.info("[ensure_models_loaded] All models ready")
+
+    def ensure_dit_loaded(self):
+        """Thread-safe lazy loader: loads ONLY DiT model (for training, no VAE/text encoder needed)."""
+        if self._dit_loaded:
+            return
+        with self._load_lock:
+            if self._dit_loaded:
+                return
+            logger.info("[ensure_dit_loaded] Loading DiT model for training...")
+            self._load_dit()
+            logger.info("[ensure_dit_loaded] DiT model ready")
     
     def _is_on_target_device(self, tensor, target_device):
         """Check if tensor is on the target device (handles cuda vs cuda:0 comparison)."""
@@ -2878,14 +2938,18 @@ class AceStepHandler:
             def progress(*args, **kwargs):
                 pass
 
-        if self.model is None or self.vae is None or self.text_tokenizer is None or self.text_encoder is None:
-            return {
-                "audios": [],
-                "status_message": "❌ Model not fully initialized. Please initialize all components first.",
-                "extra_outputs": {},
-                "success": False,
-                "error": "Model not fully initialized",
-            }
+        # Lazy-load all models if not yet loaded
+        if not self._models_loaded:
+            if self._init_params:
+                self.ensure_models_loaded()
+            else:
+                return {
+                    "audios": [],
+                    "status_message": "❌ Model not initialized. Call initialize_service() first.",
+                    "extra_outputs": {},
+                    "success": False,
+                    "error": "Model not initialized",
+                }
 
         def _has_audio_codes(v: Union[str, List[str]]) -> bool:
             if isinstance(v, list):
