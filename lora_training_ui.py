@@ -725,6 +725,14 @@ def preprocess_dataset(
     if not tag:
         return "❌ Activation Tag is empty! Set an activation tag in the Dataset tab before preprocessing.", get_status_html()
 
+    # Preprocessing needs VAE (audio→latents) + text_encoder (captions→embeddings).
+    # If only DiT was loaded (training-only init), load remaining models now.
+    progress(0.1, desc="Ensuring VAE & text encoder are loaded...")
+    try:
+        dit_handler.ensure_models_loaded()
+    except Exception as e:
+        return f"❌ Failed to load models for preprocessing: {e}", get_status_html()
+
     # Always re-apply the tag from UI fields onto builder + all samples
     # This ensures the tag is never lost even if gr.State was stale
     builder_state.metadata.custom_tag = tag
@@ -746,7 +754,7 @@ def preprocess_dataset(
     def progress_callback(msg):
         progress(0.5, desc=msg)
 
-    progress(0.1, desc="Starting preprocessing...")
+    progress(0.2, desc="Starting preprocessing...")
 
     output_paths, status = builder_state.preprocess_to_tensors(
         dit_handler=dit_handler,

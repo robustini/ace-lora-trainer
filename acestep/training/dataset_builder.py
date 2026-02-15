@@ -1008,14 +1008,20 @@ class DatasetBuilder:
         # Validate handler
         if dit_handler is None or dit_handler.model is None:
             return [], "❌ Model not initialized. Please initialize the service first."
-        
+
+        # Validate required components (VAE + text_encoder needed for preprocessing)
+        if dit_handler.vae is None:
+            return [], "❌ VAE not loaded. Preprocessing requires VAE to encode audio. Please re-initialize the service."
+        if dit_handler.text_encoder is None:
+            return [], "❌ Text encoder not loaded. Preprocessing requires the text encoder. Please re-initialize the service."
+
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
-        
+
         output_paths = []
         success_count = 0
         fail_count = 0
-        
+
         # Get model and components
         model = dit_handler.model
         vae = dit_handler.vae

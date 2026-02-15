@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-02-15f — Fix Preprocessing Crash (VAE not loaded)
+
+**Bug:** Preprocessing failed with `AttributeError: 'NoneType' object has no attribute 'dtype'` because lazy loading only loaded the DiT model at initialization, leaving VAE and text encoder as `None`. Preprocessing requires both.
+
+**Fix:**
+- `lora_training_ui.py`: `preprocess_dataset()` now calls `dit_handler.ensure_models_loaded()` before preprocessing to auto-load VAE + text encoder if needed
+- `dataset_builder.py`: Added explicit guard checks for `vae is None` and `text_encoder is None` with clear error messages instead of cryptic `AttributeError`
+
+Fixes [#1](https://github.com/Estylon/ace-lora-trainer/issues/1).
+
+---
+
 ## 2026-02-15e — Adapter-Aware GPU Presets (LoRA vs LoKr)
 
 GPU presets now differentiate between LoRA and LoKr training parameters.
