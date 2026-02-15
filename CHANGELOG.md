@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-02-15e — Adapter-Aware GPU Presets (LoRA vs LoKr)
+
+GPU presets now differentiate between LoRA and LoKr training parameters.
+
+**Key LoKr preset differences vs LoRA:**
+- **Learning rate:** 3e-4 (vs 1e-4) — Kronecker factorization benefits from higher LR
+- **Gradient accumulation:** 4-8x (vs 1-2x) — smooths noisy gradients from smaller effective batch
+- **Epochs:** 500 (vs 800-1000) — LoKr converges faster
+- **Optimizer:** AdamW (vs Prodigy) — standard optimizer, more predictable with LoKr
+- **Dropout:** 0.0 (vs 0.1) — LoKr already has implicit regularization via Kronecker structure
+- **Early stop patience:** 50 (vs 80) — faster convergence = detect plateau earlier
+- **Best-model warmup:** 100 (vs 200) — start tracking best MA5 sooner
+
+**How it works:**
+- Selecting a GPU preset applies the LoRA or LoKr sub-preset based on the current Adapter Type selection
+- Switching Adapter Type (LoRA↔LoKr) while a preset is active automatically re-applies the correct sub-preset
+- LoKr-specific fields (Factor, Linear Dim, Linear Alpha, Decompose Both, Tucker, Dropout) are also set by presets
+- "Custom" preset still leaves everything unchanged
+
+### Other fixes
+- **GPU VRAM status not showing** — Fixed `total_mem` → `total_memory` typo in `get_vram_info()`
+- **Final model uses best MA5** — Training completion now copies the best MA5 checkpoint as `final/` instead of saving last-epoch weights
+
+---
+
 ## 2026-02-15c — Custom Checkpoints Folder
 
 Added the ability to select a custom folder for model checkpoints in the Service tab.

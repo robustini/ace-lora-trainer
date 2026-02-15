@@ -1195,120 +1195,137 @@ def start_training(
 # ==================== GPU TRAINING PRESETS ====================
 # Each preset is a dict of UI values optimized for a specific GPU tier.
 # Keys must match the Gradio component variable names.
+# Shared training params common to both LoRA and LoKr (merged into presets)
+_COMMON_TRAINING_PARAMS = {
+    "early_stop_enabled": True,
+    "torch_compile": False,
+}
+
 GPU_PRESETS = {
     "Custom": None,  # No changes — user's current settings
+
     "RTX 4090 / 5090 (24GB+)": {
-        "lora_rank": 64,
-        "lora_alpha": 128,
-        "lora_dropout": 0.1,
-        "learning_rate": 1e-4,
-        "max_epochs": 800,
-        "batch_size": 3,
-        "gradient_accumulation": 1,
-        "optimizer_type": "prodigy",
-        "scheduler_type": "cosine",
-        "attention_type": "both",
-        "gradient_checkpointing": False,
-        "encoder_offloading": False,
-        "torch_compile": False,
-        "early_stop_enabled": True,
-        "early_stop_patience": 80,
-        "auto_save_best_after": 200,
-        "save_every_n_epochs": 50,
-        "max_latent_length": 1500,
+        "lora": {
+            "lora_rank": 64, "lora_alpha": 128, "lora_dropout": 0.1,
+            "learning_rate": 1e-4, "max_epochs": 800,
+            "batch_size": 3, "gradient_accumulation": 1,
+            "optimizer_type": "prodigy", "scheduler_type": "cosine",
+            "attention_type": "both",
+            "gradient_checkpointing": False, "encoder_offloading": False,
+            "early_stop_patience": 80, "auto_save_best_after": 200,
+            "save_every_n_epochs": 50, "max_latent_length": 1500,
+        },
+        "lokr": {
+            "lora_rank": 64, "lora_alpha": 128, "lora_dropout": 0.0,
+            "learning_rate": 3e-4, "max_epochs": 500,
+            "batch_size": 2, "gradient_accumulation": 4,
+            "optimizer_type": "adamw", "scheduler_type": "cosine",
+            "attention_type": "both",
+            "gradient_checkpointing": False, "encoder_offloading": False,
+            "early_stop_patience": 50, "auto_save_best_after": 100,
+            "save_every_n_epochs": 50, "max_latent_length": 1500,
+            # LoKr-specific adapter params
+            "lokr_factor": -1, "lokr_linear_dim": 10000, "lokr_linear_alpha": 1.0,
+            "lokr_decompose_both": False, "lokr_use_tucker": False, "lokr_dropout": 0.0, "lokr_dropout": 0.0,
+        },
     },
+
     "RTX 3090 / 4080 (16-24GB)": {
-        "lora_rank": 64,
-        "lora_alpha": 128,
-        "lora_dropout": 0.1,
-        "learning_rate": 1e-4,
-        "max_epochs": 800,
-        "batch_size": 2,
-        "gradient_accumulation": 2,
-        "optimizer_type": "prodigy",
-        "scheduler_type": "cosine",
-        "attention_type": "both",
-        "gradient_checkpointing": False,
-        "encoder_offloading": False,
-        "torch_compile": False,
-        "early_stop_enabled": True,
-        "early_stop_patience": 80,
-        "auto_save_best_after": 200,
-        "save_every_n_epochs": 50,
-        "max_latent_length": 1500,
+        "lora": {
+            "lora_rank": 64, "lora_alpha": 128, "lora_dropout": 0.1,
+            "learning_rate": 1e-4, "max_epochs": 800,
+            "batch_size": 2, "gradient_accumulation": 2,
+            "optimizer_type": "prodigy", "scheduler_type": "cosine",
+            "attention_type": "both",
+            "gradient_checkpointing": False, "encoder_offloading": False,
+            "early_stop_patience": 80, "auto_save_best_after": 200,
+            "save_every_n_epochs": 50, "max_latent_length": 1500,
+        },
+        "lokr": {
+            "lora_rank": 64, "lora_alpha": 128, "lora_dropout": 0.0,
+            "learning_rate": 3e-4, "max_epochs": 500,
+            "batch_size": 1, "gradient_accumulation": 8,
+            "optimizer_type": "adamw", "scheduler_type": "cosine",
+            "attention_type": "both",
+            "gradient_checkpointing": False, "encoder_offloading": False,
+            "early_stop_patience": 50, "auto_save_best_after": 100,
+            "save_every_n_epochs": 50, "max_latent_length": 1500,
+            "lokr_factor": -1, "lokr_linear_dim": 10000, "lokr_linear_alpha": 1.0,
+            "lokr_decompose_both": False, "lokr_use_tucker": False, "lokr_dropout": 0.0, "lokr_dropout": 0.0,
+        },
     },
+
     "RTX 3080 / 4070 (10-12GB)": {
-        "lora_rank": 32,
-        "lora_alpha": 64,
-        "lora_dropout": 0.1,
-        "learning_rate": 1e-4,
-        "max_epochs": 1000,
-        "batch_size": 1,
-        "gradient_accumulation": 4,
-        "optimizer_type": "adamw8bit",
-        "scheduler_type": "cosine",
-        "attention_type": "both",
-        "gradient_checkpointing": True,
-        "encoder_offloading": True,
-        "torch_compile": False,
-        "early_stop_enabled": True,
-        "early_stop_patience": 80,
-        "auto_save_best_after": 200,
-        "save_every_n_epochs": 50,
-        "max_latent_length": 1500,
+        "lora": {
+            "lora_rank": 32, "lora_alpha": 64, "lora_dropout": 0.1,
+            "learning_rate": 1e-4, "max_epochs": 1000,
+            "batch_size": 1, "gradient_accumulation": 4,
+            "optimizer_type": "adamw8bit", "scheduler_type": "cosine",
+            "attention_type": "both",
+            "gradient_checkpointing": True, "encoder_offloading": True,
+            "early_stop_patience": 80, "auto_save_best_after": 200,
+            "save_every_n_epochs": 50, "max_latent_length": 1500,
+        },
+        "lokr": {
+            "lora_rank": 32, "lora_alpha": 64, "lora_dropout": 0.0,
+            "learning_rate": 3e-4, "max_epochs": 500,
+            "batch_size": 1, "gradient_accumulation": 8,
+            "optimizer_type": "adamw", "scheduler_type": "cosine",
+            "attention_type": "both",
+            "gradient_checkpointing": True, "encoder_offloading": True,
+            "early_stop_patience": 50, "auto_save_best_after": 100,
+            "save_every_n_epochs": 50, "max_latent_length": 1500,
+            "lokr_factor": -1, "lokr_linear_dim": 10000, "lokr_linear_alpha": 1.0,
+            "lokr_decompose_both": False, "lokr_use_tucker": False, "lokr_dropout": 0.0,
+        },
     },
+
     "RTX 3060 / 4060 (8GB)": {
-        "lora_rank": 16,
-        "lora_alpha": 32,
-        "lora_dropout": 0.1,
-        "learning_rate": 1e-4,
-        "max_epochs": 1000,
-        "batch_size": 1,
-        "gradient_accumulation": 4,
-        "optimizer_type": "adafactor",
-        "scheduler_type": "constant_with_warmup",
-        "attention_type": "self",
-        "gradient_checkpointing": True,
-        "encoder_offloading": True,
-        "torch_compile": False,
-        "early_stop_enabled": True,
-        "early_stop_patience": 80,
-        "auto_save_best_after": 200,
-        "save_every_n_epochs": 50,
-        "max_latent_length": 1000,
+        "lora": {
+            "lora_rank": 16, "lora_alpha": 32, "lora_dropout": 0.1,
+            "learning_rate": 1e-4, "max_epochs": 1000,
+            "batch_size": 1, "gradient_accumulation": 4,
+            "optimizer_type": "adafactor", "scheduler_type": "constant_with_warmup",
+            "attention_type": "self",
+            "gradient_checkpointing": True, "encoder_offloading": True,
+            "early_stop_patience": 80, "auto_save_best_after": 200,
+            "save_every_n_epochs": 50, "max_latent_length": 1000,
+        },
+        "lokr": {
+            "lora_rank": 16, "lora_alpha": 32, "lora_dropout": 0.0,
+            "learning_rate": 1e-4, "max_epochs": 500,
+            "batch_size": 1, "gradient_accumulation": 4,
+            "optimizer_type": "adafactor", "scheduler_type": "constant_with_warmup",
+            "attention_type": "self",
+            "gradient_checkpointing": True, "encoder_offloading": True,
+            "early_stop_patience": 50, "auto_save_best_after": 100,
+            "save_every_n_epochs": 50, "max_latent_length": 1000,
+            "lokr_factor": -1, "lokr_linear_dim": 10000, "lokr_linear_alpha": 1.0,
+            "lokr_decompose_both": False, "lokr_use_tucker": False, "lokr_dropout": 0.0,
+        },
     },
 }
 
 
-def apply_gpu_preset(preset_name):
+def _no_change_tuple():
+    """Return a tuple of gr.update() for all preset outputs (no changes)."""
+    return tuple(gr.update() for _ in range(25))  # 19 shared + 6 lokr fields
+
+
+def apply_gpu_preset(preset_name, current_adapter_type="LoRA"):
     """Apply a GPU preset to all training parameters.
 
+    Selects LoRA or LoKr sub-preset based on the currently selected adapter type.
     Returns a tuple of gr.update() calls matching the order of output components.
     """
-    preset = GPU_PRESETS.get(preset_name)
-    if preset is None:
+    preset_entry = GPU_PRESETS.get(preset_name)
+    if preset_entry is None:
         # "Custom" — no changes
-        return (
-            gr.update(),  # lora_rank
-            gr.update(),  # lora_alpha
-            gr.update(),  # lora_dropout
-            gr.update(),  # learning_rate
-            gr.update(),  # max_epochs
-            gr.update(),  # batch_size
-            gr.update(),  # gradient_accumulation
-            gr.update(),  # optimizer_type
-            gr.update(),  # scheduler_type
-            gr.update(),  # attention_type
-            gr.update(),  # gradient_checkpointing
-            gr.update(),  # encoder_offloading
-            gr.update(),  # torch_compile
-            gr.update(),  # early_stop_enabled
-            gr.update(),  # early_stop_patience
-            gr.update(),  # auto_save_best_after
-            gr.update(),  # save_every_n_epochs
-            gr.update(),  # max_latent_length
-            gr.update(),  # adapter_type
-        )
+        return _no_change_tuple()
+
+    # Determine which sub-preset to use
+    adapter_key = "lokr" if current_adapter_type == "LoKr" else "lora"
+    preset = preset_entry.get(adapter_key, preset_entry.get("lora", {}))
 
     return (
         gr.update(value=preset["lora_rank"]),
@@ -1323,13 +1340,20 @@ def apply_gpu_preset(preset_name):
         gr.update(value=preset["attention_type"]),
         gr.update(value=preset["gradient_checkpointing"]),
         gr.update(value=preset["encoder_offloading"]),
-        gr.update(value=preset["torch_compile"]),
-        gr.update(value=preset["early_stop_enabled"]),
+        gr.update(value=_COMMON_TRAINING_PARAMS["torch_compile"]),
+        gr.update(value=_COMMON_TRAINING_PARAMS["early_stop_enabled"]),
         gr.update(value=preset["early_stop_patience"]),
         gr.update(value=preset["auto_save_best_after"]),
         gr.update(value=preset["save_every_n_epochs"]),
         gr.update(value=preset["max_latent_length"]),
-        gr.update(value=preset.get("adapter_type", "LoRA")),
+        gr.update(value=current_adapter_type),  # keep current adapter type
+        # LoKr-specific fields (only meaningful when adapter_type=LoKr)
+        gr.update(value=preset.get("lokr_factor", -1)),
+        gr.update(value=preset.get("lokr_linear_dim", 10000)),
+        gr.update(value=preset.get("lokr_linear_alpha", 1.0)),
+        gr.update(value=preset.get("lokr_decompose_both", False)),
+        gr.update(value=preset.get("lokr_use_tucker", False)),
+        gr.update(value=preset.get("lokr_dropout", 0.0)),
     )
 
 
@@ -2345,7 +2369,7 @@ def create_ui():
         # GPU Presets
         gpu_preset.change(
             fn=apply_gpu_preset,
-            inputs=[gpu_preset],
+            inputs=[gpu_preset, adapter_type],
             outputs=[
                 lora_rank, lora_alpha, lora_dropout,
                 learning_rate, max_epochs, batch_size, gradient_accumulation,
@@ -2354,6 +2378,25 @@ def create_ui():
                 early_stop_enabled, early_stop_patience_val, auto_save_best_after,
                 save_every_n_epochs, max_latent_length,
                 adapter_type,
+                # LoKr-specific fields
+                lokr_factor, lokr_linear_dim, lokr_linear_alpha,
+                lokr_decompose_both, lokr_use_tucker, lokr_dropout,
+            ],
+        )
+        # Also re-apply preset when adapter type changes (LoRA↔LoKr)
+        adapter_type.change(
+            fn=apply_gpu_preset,
+            inputs=[gpu_preset, adapter_type],
+            outputs=[
+                lora_rank, lora_alpha, lora_dropout,
+                learning_rate, max_epochs, batch_size, gradient_accumulation,
+                optimizer_type, scheduler_type, attention_type,
+                gradient_checkpointing_enabled, encoder_offloading_enabled, torch_compile_enabled,
+                early_stop_enabled, early_stop_patience_val, auto_save_best_after,
+                save_every_n_epochs, max_latent_length,
+                adapter_type,
+                lokr_factor, lokr_linear_dim, lokr_linear_alpha,
+                lokr_decompose_both, lokr_use_tucker, lokr_dropout,
             ],
         )
 
