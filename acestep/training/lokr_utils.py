@@ -140,6 +140,16 @@ def inject_lokr_into_dit(
     # Apply the LoKr hooks to the decoder
     lycoris_net.apply_to()
 
+    # CRITICAL: LyCORIS creates adapter parameters on CPU regardless of where
+    # the decoder lives. We must explicitly move everything to the decoder's
+    # device so all parameters (base + adapter) are co-located. Without this,
+    # every forward pass triggers CPU→GPU transfers, making training ~10-50x slower.
+    decoder_device = next(decoder.parameters()).device
+    lycoris_net = lycoris_net.to(decoder_device)
+    # Also ensure any new params injected into the decoder are on the right device
+    model.decoder = model.decoder.to(decoder_device)
+    logger.info(f"LoKr adapter parameters moved to {decoder_device}")
+
     # Freeze all base model parameters, keep only LoKr params trainable
     for param in model.parameters():
         param.requires_grad = False

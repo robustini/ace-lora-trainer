@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-02-15b — LoKr Training Speed Fix + lycoris-lora Required
+
+### Critical Fix: LoKr Training 10-50x Slower Than LoRA
+
+**Root cause:** The LyCORIS library creates adapter parameters on **CPU** regardless of where the decoder lives (GPU). Our code never explicitly relocated these parameters to GPU after injection. Every forward pass during LoKr training triggered CPU→GPU data transfers, making training catastrophically slow (~300s/epoch for 32 samples vs ~10s for LoRA).
+
+**How we found it:** The upstream [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) V2 training module (`training_v2/fixed_lora_module.py`) has an explicit `.to(self.device)` call after LoKr injection that our V1-based trainer was missing.
+
+**Files changed:**
+- **`acestep/training/lokr_utils.py`** — After `lycoris_net.apply_to()`, explicitly move `lycoris_net` and `model.decoder` to the decoder's device so all parameters (base + adapter) are co-located before training begins.
+- **`acestep/training/trainer.py`** — In both `_train_with_fabric()` and `_train_basic()`, ensure `lycoris_net` params match training dtype and device before Fabric setup / optimizer creation. Removed the redundant `fabric.setup_module(decoder)` call that was double-wrapping the decoder.
+
+### lycoris-lora Now a Required Dependency
+
+- `requirements.txt` — Changed `lycoris-lora>=2.0.0` from optional (commented) to required. LoKr is a first-class adapter type alongside LoRA.
+
+---
+
 ## 2026-02-15 — Lazy/On-Demand Model Loading
 
 Reduced idle VRAM usage and startup time by loading models only when needed.

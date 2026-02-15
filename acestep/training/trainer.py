@@ -670,11 +670,18 @@ class LoRATrainer:
 
         # Setup with Fabric
         # For LoRA: setup the decoder (which contains PEFT wrapper)
-        # For LoKr: setup the lycoris_net (which manages the trainable params)
+        # For LoKr: setup BOTH lycoris_net AND the decoder with Fabric.
+        #   The decoder must go through Fabric for proper mixed-precision handling.
+        #   LyCORIS hooks modify the forward pass, but Fabric needs to manage the
+        #   decoder's autocast/grad-scaling. We also ensure the lycoris_net params
+        #   are on the correct device and dtype before Fabric wraps them.
         if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            # Ensure lycoris_net params match the training dtype and device
+            target_device = self.module.device
+            self.module.lycoris_net = self.module.lycoris_net.to(device=target_device, dtype=train_dtype)
+            # Ensure all decoder params (including any LyCORIS-injected ones) are co-located
+            self.module.model.decoder = self.module.model.decoder.to(device=target_device)
             self.module.lycoris_net, optimizer = self.fabric.setup(self.module.lycoris_net, optimizer)
-            # Also move the decoder to the right device/dtype via Fabric
-            self.module.model.decoder = self.fabric.setup_module(self.module.model.decoder)
         else:
             self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
 
@@ -951,6 +958,13 @@ class LoRATrainer:
         train_dtype = precision_to_dtype(resolved_precision)
         self.module.dtype = train_dtype
         self.module.model = self.module.model.to(train_dtype)
+
+        # For LoKr: ensure lycoris_net params are on correct device/dtype
+        # LyCORIS creates adapter params on CPU; they must be co-located with the decoder
+        if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
+            target_device = self.module.device
+            self.module.lycoris_net = self.module.lycoris_net.to(device=target_device, dtype=train_dtype)
+            self.module.model.decoder = self.module.model.decoder.to(device=target_device)
 
         # Use GradScaler for fp16 (bf16 and fp32 don't need it)
         use_scaler = resolved_precision == "fp16" and self.module.device.type == "cuda"
