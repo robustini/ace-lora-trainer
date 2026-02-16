@@ -146,6 +146,7 @@ Examples:
     parser.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=7861, help="Port (default: 7861)")
     parser.add_argument("--share", action="store_true", help="Create public Gradio link")
+    parser.add_argument("--skip-env-check", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -154,24 +155,42 @@ Examples:
     elif args.mode == "caption":
         launch_captioner_ui(args.host, args.port, args.share)
     elif args.mode == "both":
-        import threading
+        import subprocess
 
-        # Training on main thread, captioner on background thread
         captioner_port = args.port + 1
         print(f"\n{'='*50}")
         print(f"  Training UI:  http://{args.host}:{args.port}")
         print(f"  Captioner UI: http://{args.host}:{captioner_port}")
         print(f"{'='*50}\n")
 
-        t = threading.Thread(
-            target=launch_captioner_ui,
-            args=(args.host, captioner_port, args.share),
-            daemon=True,
+        # Launch captioner in a separate process to avoid Gradio event loop conflicts
+        captioner_cmd = [
+            sys.executable, __file__,
+            "--mode", "caption",
+            "--host", args.host,
+            "--port", str(captioner_port),
+            "--skip-env-check",
+        ]
+        if args.share:
+            captioner_cmd.append("--share")
+
+        captioner_proc = subprocess.Popen(
+            captioner_cmd,
+            # Inherit stdout/stderr so logs are visible
+            stdout=sys.stdout,
+            stderr=sys.stderr,
         )
-        t.start()
-        launch_training_ui(args.host, args.port, args.share)
+
+        try:
+            launch_training_ui(args.host, args.port, args.share)
+        finally:
+            # When the training UI exits, also stop the captioner process
+            captioner_proc.terminate()
+            captioner_proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
-    check_environment()
+    # Skip env check when spawned as subprocess (already validated by parent)
+    if "--skip-env-check" not in sys.argv:
+        check_environment()
     main()

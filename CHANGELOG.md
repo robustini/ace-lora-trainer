@@ -1,14 +1,18 @@
 # Changelog
 
-## 2026-02-16a — Optional LLM Download for Auto-Labeling
+## 2026-02-16a — Optional LLM Download + Fix `--mode both`
 
+### Optional LLM Download for Auto-Labeling
 The LLM for AI auto-labeling is now fully optional with on-demand download.
 
-**Changes:**
 - Added **"Download & Enable AI Labeling (~3.5 GB)"** button in the Dataset tab's auto-label section
 - LLM is no longer required at startup — users can download it when needed
 - Auto-label error message now directs users to either download the LLM or use CSV/manual labeling
 - Info box recommends standalone captioning tools for higher quality captions (importable via CSV)
+
+### Fix `--mode both` captioner not starting
+- **Bug:** `python launch.py --mode both` launched the captioner UI in a daemon thread, which could silently crash due to Gradio event loop conflicts between two apps in the same process
+- **Fix:** Captioner now runs as a **separate subprocess**, which isolates each Gradio app's event loop and makes both UIs reliable. The captioner process is automatically terminated when the training UI exits
 
 ---
 
