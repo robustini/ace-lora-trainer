@@ -150,39 +150,56 @@ class AceStepCaptioner:
         """Extract musical key from model output using cascading regex patterns."""
         import re
 
-        # 1. Structured "key: D Minor" or "key: C# Major"
-        m = re.search(r'key[:\s]+([A-Ga-g][#b♯♭]?\s*(?:natural\s+)?(?:major|minor|maj|min))', raw, re.IGNORECASE)
+        # Normalize unicode sharps/flats
+        raw_n = raw.replace('♯', '#').replace('♭', 'b')
+
+        # 1. Structured "key: D Minor" or "key: C# Major" or "key: Bb minor"
+        m = re.search(r'key[:\s]+([A-Ga-g][#b]?\s*(?:natural\s+)?(?:major|minor|maj|min))', raw_n, re.IGNORECASE)
         if m:
             val = m.group(1).strip().title()
             return re.sub(r'\s*Natural\s+', ' ', val).strip()
 
         # 2. Shorthand "key: Dm" or "key: D#m"
-        m = re.search(r'key[:\s]+([A-Ga-g][#b♯♭]?)\s*m\b', raw, re.IGNORECASE)
+        m = re.search(r'key[:\s]+([A-Ga-g][#b]?)\s*m\b', raw_n, re.IGNORECASE)
         if m:
             return m.group(1).strip().upper() + " Minor"
 
         # 3. "key: D" (note only) — check nearby text for major/minor
-        m = re.search(r'key[:\s]+([A-Ga-g][#b♯♭]?)\b', raw, re.IGNORECASE)
+        m = re.search(r'key[:\s]+([A-Ga-g][#b]?)\b', raw_n, re.IGNORECASE)
         if m:
             note = m.group(1).strip().upper()
-            after = raw[m.end():m.end() + 30].lower()
+            after = raw_n[m.end():m.end() + 40].lower()
             if 'min' in after:
                 return f"{note} Minor"
             elif 'maj' in after:
                 return f"{note} Major"
             return note
 
-        # 4. Anywhere: "D Minor", "C# Major", "Bb minor" etc.
-        m = re.search(r'\b([A-G][#b♯♭]?\s+(?:major|minor|maj|min))\b', raw, re.IGNORECASE)
-        if m:
-            return m.group(1).strip().title()
-
-        # 5. Anywhere: "in D minor", "the key of A"
-        m = re.search(r'(?:in|of)\s+([A-G][#b♯♭]?)\s*(major|minor|maj|min)', raw, re.IGNORECASE)
+        # 4. "is D minor", "is in C# major", "in the key of A minor"
+        m = re.search(r'(?:is\s+(?:in\s+)?|in\s+(?:the\s+)?(?:key\s+of\s+)?)([A-G][#b]?)\s*(major|minor|maj|min)', raw_n, re.IGNORECASE)
         if m:
             note = m.group(1).strip().upper()
             mode = "Major" if "maj" in m.group(2).lower() else "Minor"
             return f"{note} {mode}"
+
+        # 5. Anywhere: "D Minor", "C# Major", "Bb minor" — standalone note + mode
+        m = re.search(r'\b([A-G][#b]?\s*(?:major|minor|maj|min))\b', raw_n, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().title()
+
+        # 6. Anywhere: shorthand "Dm", "C#m", "Am" (only if clearly a music key context)
+        m = re.search(r'\b([A-G][#b]?)m(?:aj|in(?:or)?)?\b', raw_n, re.IGNORECASE)
+        if m:
+            note = m.group(1).upper()
+            rest = raw_n[m.start():m.end()].lower()
+            if 'maj' in rest:
+                return f"{note} Major"
+            return f"{note} Minor"
+
+        # 7. Last resort: standalone note letter near key-related words
+        m = re.search(r'(?:key|scale|tonal(?:ity)?|pitched?\s+(?:in|at))\s+(?:of\s+)?([A-G][#b]?)\b', raw_n, re.IGNORECASE)
+        if m:
+            return m.group(1).strip().upper()
 
         return ""
 
@@ -261,26 +278,36 @@ class AceStepCaptioner:
         # Save input length to strip prompt tokens from output
         input_len = inputs["input_ids"].shape[-1]
 
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                thinker_max_new_tokens=max_new_tokens,
-                return_audio=False,
-                thinker_do_sample=True,
-                thinker_temperature=0.7,
-                thinker_top_p=0.9,
-            )
+        try:
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs,
+                    thinker_max_new_tokens=max_new_tokens,
+                    return_audio=False,
+                    thinker_do_sample=True,
+                    thinker_temperature=0.7,
+                    thinker_top_p=0.9,
+                )
 
-        # Strip input tokens — generate() returns full sequence (input + new tokens)
-        new_tokens = output_ids[:, input_len:]
+            # Strip input tokens — generate() returns full sequence (input + new tokens)
+            new_tokens = output_ids[:, input_len:]
 
-        result = self.processor.batch_decode(
-            new_tokens,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
+            result = self.processor.batch_decode(
+                new_tokens,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
 
-        return self._clean_model_output(result)
+            return self._clean_model_output(result)
+        finally:
+            # Free GPU memory: delete input/output tensors and KV-cache after EACH inference
+            del inputs
+            if 'output_ids' in dir():
+                del output_ids
+            if 'new_tokens' in dir():
+                del new_tokens
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def analyze_audio_metadata(self, audio_path: str, audio_array=None, sr: int = 16000) -> dict:
         """
@@ -336,16 +363,13 @@ class AceStepCaptioner:
             try:
                 import re
                 prompt = (
-                    "Analyze this audio and respond with EXACTLY these three lines:\n"
-                    "key: <note> <Major or Minor>\n"
-                    "time_signature: <number>\n"
-                    "genre: <genre>\n\n"
-                    "Example:\n"
-                    "key: D Minor\n"
+                    "What is the musical key, time signature, and genre of this audio? "
+                    "Reply in this exact format (one per line):\n"
+                    "key: C Minor\n"
                     "time_signature: 4\n"
-                    "genre: electronic pop"
+                    "genre: rock"
                 )
-                raw = self._run_inference(audio_array, prompt, max_new_tokens=100)
+                raw = self._run_inference(audio_array, prompt, max_new_tokens=150)
                 print(f"  [Metadata] Qwen raw: {repr(raw[:300])}")
 
                 raw_lower = raw.lower()
@@ -358,12 +382,12 @@ class AceStepCaptioner:
                 if ts_match:
                     metadata["timesignature"] = ts_match.group(1)
                 else:
-                    # Fallback: look for "X/Y" pattern
-                    ts_match2 = re.search(r'(\d)/\d\s*(?:time|meter|beat)', raw_lower)
+                    # Fallback: "4/4", "3/4", "6/8" anywhere in text
+                    ts_match2 = re.search(r'\b(\d)/\d+\b', raw_lower)
                     if ts_match2:
                         metadata["timesignature"] = ts_match2.group(1)
                     else:
-                        # Default to 4 for most pop/rock music
+                        # Default to 4 for most music
                         metadata["timesignature"] = "4"
 
                 # --- Parse genre ---
@@ -376,7 +400,7 @@ class AceStepCaptioner:
 
         return metadata
 
-    def transcribe_lyrics(self, audio_path: str, max_new_tokens: int = 1024, language: str = "auto") -> tuple:
+    def transcribe_lyrics(self, audio_path: str, max_new_tokens: int = 1024, language: str = "auto", audio_array=None) -> tuple:
         """
         Transcribe lyrics using ACE-Step Transcriber.
         Produces structured lyrics with section tags ([Verse], [Chorus], etc.)
@@ -386,6 +410,7 @@ class AceStepCaptioner:
             audio_path: Path to the audio file
             max_new_tokens: Maximum tokens to generate
             language: Not used (transcriber auto-detects), kept for API compatibility
+            audio_array: Pre-loaded audio array at 16kHz (optional, avoids reloading)
 
         Returns:
             Tuple of (lyrics_text, detected_language)
@@ -396,12 +421,12 @@ class AceStepCaptioner:
             if self.transcriber_model is None:
                 return "❌ Transcriber not loaded. Load model first.", "unknown"
 
-            try:
-                import librosa
-            except ImportError:
-                return "❌ librosa not installed. Run: pip install librosa", "unknown"
-
-            audio_array, sr = librosa.load(audio_path, sr=16000, mono=True)
+            if audio_array is None:
+                try:
+                    import librosa
+                except ImportError:
+                    return "❌ librosa not installed. Run: pip install librosa", "unknown"
+                audio_array, sr = librosa.load(audio_path, sr=16000, mono=True)
 
             print(f"  [Transcriber] Processing {Path(audio_path).name} ({len(audio_array)/sr:.1f}s)...")
             raw_output = self._transcriber_inference(audio_array, max_new_tokens=max_new_tokens)
@@ -563,21 +588,31 @@ class AceStepCaptioner:
 
         input_len = inputs["input_ids"].shape[-1]
 
-        with torch.no_grad():
-            output_ids = self.transcriber_model.generate(
-                **inputs,
-                thinker_max_new_tokens=max_new_tokens,
-                return_audio=False,
-                thinker_do_sample=False,
-            )
+        try:
+            with torch.no_grad():
+                output_ids = self.transcriber_model.generate(
+                    **inputs,
+                    thinker_max_new_tokens=max_new_tokens,
+                    return_audio=False,
+                    thinker_do_sample=False,
+                )
 
-        new_tokens = output_ids[:, input_len:]
+            new_tokens = output_ids[:, input_len:]
 
-        result = self.transcriber_processor.batch_decode(
-            new_tokens,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
+            result = self.transcriber_processor.batch_decode(
+                new_tokens,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+        finally:
+            # Free GPU memory after each inference to prevent OOM on batch processing
+            del inputs
+            if 'output_ids' in dir():
+                del output_ids
+            if 'new_tokens' in dir():
+                del new_tokens
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return self._clean_model_output(result)
 
@@ -955,7 +990,7 @@ def start_captioning_ui(input_dir, activation_tag, generate_lyrics, save_csv, cs
                 step_label = f"[{i+1}/{len(audio_files)}] Transcribing lyrics: {audio_path.name}"
                 progress(current_step / total_steps, desc=step_label)
 
-            lyrics, detected_lang = _ui_captioner.transcribe_lyrics(str(audio_path), max_new_tokens=1024)
+            lyrics, detected_lang = _ui_captioner.transcribe_lyrics(str(audio_path), max_new_tokens=1024, audio_array=audio_array)
             result["lyrics"] = lyrics
             result["language"] = detected_lang
             result["is_instrumental"] = (lyrics.strip() == "[Instrumental]")

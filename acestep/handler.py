@@ -447,6 +447,7 @@ class AceStepHandler:
         quantization: Optional[str] = None,
         prefer_source: Optional[str] = None,
         lazy: bool = False,
+        custom_checkpoint_dir: Optional[str] = None,
     ) -> Tuple[str, bool]:
         """
         Initialize DiT model service.
@@ -465,6 +466,9 @@ class AceStepHandler:
             offload_dit_to_cpu: Whether to offload DiT model to CPU when not in use (only effective if offload_to_cpu is True)
             prefer_source: Preferred download source ("huggingface", "modelscope", or None for auto-detect)
             lazy: If True, defer model weight loading until first use
+            custom_checkpoint_dir: Optional custom checkpoint directory. When provided,
+                models are loaded from here instead of the default location.
+                Missing models are still downloaded to the default directory.
 
         Returns:
             (status_message, enable_generate_button)
@@ -494,29 +498,70 @@ class AceStepHandler:
                     raise ImportError("torchao is required for quantization but is not installed. Please install torchao to use quantization features.")
 
 
-            # Auto-detect project root (independent of passed project_root parameter)
+            # Determine checkpoint directory:
+            # 1. If custom_checkpoint_dir is provided AND contains the model, use it
+            # 2. Otherwise fall back to the default project checkpoints dir
             actual_project_root = self._get_project_root()
-            checkpoint_dir = os.path.join(actual_project_root, "checkpoints")
+            default_checkpoint_dir = os.path.join(actual_project_root, "checkpoints")
 
-            # Auto-download models if not present
             from pathlib import Path
+
+            # Check if custom dir has the models we need
+            checkpoint_dir = default_checkpoint_dir
+            if custom_checkpoint_dir:
+                custom_path = Path(custom_checkpoint_dir)
+                if custom_path.exists():
+                    # Check if the requested DiT model exists in custom dir
+                    if (custom_path / config_path).exists():
+                        checkpoint_dir = custom_checkpoint_dir
+                        logger.info(f"[initialize_service] Using custom checkpoint dir: {checkpoint_dir}")
+                    else:
+                        # Also check if models are one level up or down
+                        for sub in [custom_path, custom_path / "checkpoints"]:
+                            if (sub / config_path).exists():
+                                checkpoint_dir = str(sub)
+                                logger.info(f"[initialize_service] Found model in: {checkpoint_dir}")
+                                break
+
             checkpoint_path = Path(checkpoint_dir)
 
             # Check and download main model components (vae, text_encoder, default DiT)
-            if not check_main_model_exists(checkpoint_path):
+            # Check both custom dir and default dir before downloading
+            custom_has_main = custom_checkpoint_dir and check_main_model_exists(Path(custom_checkpoint_dir)) if custom_checkpoint_dir else False
+            if not custom_has_main and not check_main_model_exists(checkpoint_path):
                 logger.info("[initialize_service] Main model not found, starting auto-download...")
-                success, msg = ensure_main_model(checkpoint_path, prefer_source=prefer_source)
+                # Always download to default dir to avoid polluting user's custom dir
+                download_path = Path(default_checkpoint_dir)
+                success, msg = ensure_main_model(download_path, prefer_source=prefer_source)
                 if not success:
                     return f"❌ Failed to download main model: {msg}", False
                 logger.info(f"[initialize_service] {msg}")
+                # If we were using custom dir for DiT but it doesn't have vae/text_encoder,
+                # we need to make sure _init_params points to right place for each component
+                if checkpoint_dir != default_checkpoint_dir:
+                    checkpoint_dir = default_checkpoint_dir
+                    checkpoint_path = Path(checkpoint_dir)
+            elif custom_has_main:
+                # Custom dir has everything, use it
+                checkpoint_dir = custom_checkpoint_dir
+                checkpoint_path = Path(checkpoint_dir)
 
             # Check and download the requested DiT model
             if not check_model_exists(config_path, checkpoint_path):
-                logger.info(f"[initialize_service] DiT model '{config_path}' not found, starting auto-download...")
-                success, msg = ensure_dit_model(config_path, checkpoint_path, prefer_source=prefer_source)
-                if not success:
-                    return f"❌ Failed to download DiT model '{config_path}': {msg}", False
-                logger.info(f"[initialize_service] {msg}")
+                # Also check custom dir before downloading
+                custom_has_dit = custom_checkpoint_dir and check_model_exists(config_path, Path(custom_checkpoint_dir)) if custom_checkpoint_dir else False
+                if custom_has_dit:
+                    checkpoint_dir = custom_checkpoint_dir
+                    checkpoint_path = Path(checkpoint_dir)
+                else:
+                    logger.info(f"[initialize_service] DiT model '{config_path}' not found, starting auto-download...")
+                    download_path = Path(default_checkpoint_dir)
+                    success, msg = ensure_dit_model(config_path, download_path, prefer_source=prefer_source)
+                    if not success:
+                        return f"❌ Failed to download DiT model '{config_path}': {msg}", False
+                    logger.info(f"[initialize_service] {msg}")
+                    checkpoint_dir = default_checkpoint_dir
+                    checkpoint_path = Path(checkpoint_dir)
 
             # Store params for deferred loading
             self._init_params = {

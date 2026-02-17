@@ -232,6 +232,16 @@ def initialize_service(checkpoint_name: str, custom_ckpt_dir: str = "", progress
         project_root = str(ACESTEP_PATH)
 
         progress(0.3, desc=f"Loading model: {checkpoint_name}...")
+
+        # Resolve custom checkpoint directory BEFORE calling initialize_service
+        # so it checks the right location before downloading anything
+        custom_dir = (custom_ckpt_dir or "").strip()
+        resolved_custom = None
+        if custom_dir:
+            resolved = resolve_checkpoint_path(checkpoint_name, custom_dir)
+            if resolved.exists():
+                resolved_custom = str(resolved.parent)
+
         # Use lazy init: download models but only load DiT (training doesn't need VAE/text_encoder)
         status, success = dit_handler.initialize_service(
             project_root=project_root,
@@ -242,36 +252,39 @@ def initialize_service(checkpoint_name: str, custom_ckpt_dir: str = "", progress
             offload_to_cpu=False,
             offload_dit_to_cpu=False,
             lazy=True,  # Defer weight loading
+            custom_checkpoint_dir=resolved_custom,
         )
 
         if not success:
             return f"❌ Failed to initialize DiT: {status}", get_status_html(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
-
-        # If the user specified a custom checkpoints folder, check whether the
-        # selected model lives there and override the handler's checkpoint_dir
-        # so _load_dit() resolves the right path.
-        custom_dir = (custom_ckpt_dir or "").strip()
-        if custom_dir:
-            resolved = resolve_checkpoint_path(checkpoint_name, custom_dir)
-            if resolved.exists():
-                dit_handler._init_params["checkpoint_dir"] = str(resolved.parent)
 
         # Load only DiT model (skip VAE + text_encoder to save ~3GB VRAM for training)
         progress(0.5, desc="Loading DiT model...")
         dit_handler.ensure_dit_loaded()
 
         progress(0.7, desc="Initializing LLM handler...")
-        checkpoint_dir = str(get_checkpoints_dir())
+        # Use the handler's resolved checkpoint_dir (respects custom dir)
+        checkpoint_dir = dit_handler._init_params.get("checkpoint_dir", str(get_checkpoints_dir()))
 
-        # Try 4B model first, then 1.7B
+        # Try 4B model first, then 1.7B — search both handler dir and default dir
         lm_models_to_try = ["acestep-5Hz-lm-4B", "acestep-5Hz-lm-1.7B"]
         llm_model_found = None
+        llm_checkpoint_dir = checkpoint_dir  # dir where LLM is found
+
+        search_dirs = [checkpoint_dir]
+        default_ckpt = str(get_checkpoints_dir())
+        if default_ckpt != checkpoint_dir:
+            search_dirs.append(default_ckpt)
 
         for lm_model in lm_models_to_try:
-            lm_model_path = os.path.join(checkpoint_dir, lm_model)
-            weights_path = os.path.join(lm_model_path, "model-00001-of-00002.safetensors")
-            if os.path.exists(weights_path):
-                llm_model_found = lm_model
+            for search_dir in search_dirs:
+                lm_model_path = os.path.join(search_dir, lm_model)
+                weights_path = os.path.join(lm_model_path, "model-00001-of-00002.safetensors")
+                if os.path.exists(weights_path):
+                    llm_model_found = lm_model
+                    llm_checkpoint_dir = search_dir
+                    break
+            if llm_model_found:
                 break
 
         llm_info = ""
@@ -279,7 +292,7 @@ def initialize_service(checkpoint_name: str, custom_ckpt_dir: str = "", progress
             llm_handler = LLMHandler()
             progress(0.8, desc=f"Loading LLM: {llm_model_found}...")
             llm_status, llm_success = llm_handler.initialize(
-                checkpoint_dir=checkpoint_dir,
+                checkpoint_dir=llm_checkpoint_dir,
                 lm_model_path=llm_model_found,
                 backend="pt",
                 device="auto",
@@ -365,28 +378,43 @@ def download_and_init_llm(progress=gr.Progress()):
     from acestep.model_downloader import ensure_lm_model
     from pathlib import Path
 
-    checkpoint_dir = str(get_checkpoints_dir())
-    checkpoint_path = Path(checkpoint_dir)
+    # Use handler's resolved checkpoint dir (respects custom dir), fallback to default
+    handler_ckpt_dir = dit_handler._init_params.get("checkpoint_dir", "") if hasattr(dit_handler, '_init_params') else ""
+    default_ckpt_dir = str(get_checkpoints_dir())
+
+    # Search both handler dir and default dir for existing LLM
+    search_dirs = []
+    if handler_ckpt_dir:
+        search_dirs.append(handler_ckpt_dir)
+    if default_ckpt_dir != handler_ckpt_dir:
+        search_dirs.append(default_ckpt_dir)
 
     # Determine best available LLM (prefer 4B > 1.7B)
     lm_models_to_try = ["acestep-5Hz-lm-4B", "acestep-5Hz-lm-1.7B"]
     llm_model_found = None
+    llm_checkpoint_dir = default_ckpt_dir
 
     for lm_model in lm_models_to_try:
-        lm_model_path = os.path.join(checkpoint_dir, lm_model)
-        weights_path = os.path.join(lm_model_path, "model-00001-of-00002.safetensors")
-        if os.path.exists(weights_path):
-            llm_model_found = lm_model
+        for search_dir in search_dirs:
+            lm_model_path = os.path.join(search_dir, lm_model)
+            weights_path = os.path.join(lm_model_path, "model-00001-of-00002.safetensors")
+            if os.path.exists(weights_path):
+                llm_model_found = lm_model
+                llm_checkpoint_dir = search_dir
+                break
+        if llm_model_found:
             break
 
     # If no LLM found locally, download the default (1.7B)
     if not llm_model_found:
         progress(0.1, desc="Downloading LLM model (~3.5 GB)... this may take a while")
         logger.info("[download_and_init_llm] No LLM found, downloading acestep-5Hz-lm-1.7B...")
+        checkpoint_path = Path(default_ckpt_dir)
         success, msg = ensure_lm_model("acestep-5Hz-lm-1.7B", checkpoint_path)
         if not success:
             return f"❌ Failed to download LLM: {msg}", get_status_html()
         llm_model_found = "acestep-5Hz-lm-1.7B"
+        llm_checkpoint_dir = default_ckpt_dir
         logger.info(f"[download_and_init_llm] {msg}")
 
     # Initialize the LLM
@@ -394,7 +422,7 @@ def download_and_init_llm(progress=gr.Progress()):
     try:
         llm_handler = LLMHandler()
         llm_status, llm_success = llm_handler.initialize(
-            checkpoint_dir=checkpoint_dir,
+            checkpoint_dir=llm_checkpoint_dir,
             lm_model_path=llm_model_found,
             backend="pt",
             device="auto",

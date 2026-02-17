@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-02-17a — Fix Captioner OOM, Key/Scale, and Checkpoint Path
+
+### Fix captioner OOM on 32GB GPUs
+- **Bug:** Batch captioning (60+ files) caused CUDA OOM even on 32GB GPUs (5090). The `_run_inference()` and `_transcriber_inference()` methods accumulated input tensors and KV-cache across multiple calls without freeing GPU memory
+- **Fix:** Added `try/finally` cleanup in both inference methods — `inputs`, `output_ids`, and `new_tokens` are now `del`'d and `torch.cuda.empty_cache()` runs after **every single inference call**, not just between files
+- **Fix:** `transcribe_lyrics()` now accepts pre-loaded `audio_array` to avoid redundant audio reloading during batch processing
+
+### Fix key/scale extraction still failing
+- **Bug:** Key extraction returned empty for most files despite genre working fine
+- **Fix:** Improved metadata prompt to be more natural (Qwen responds better to questions than rigid format instructions)
+- **Fix:** Expanded `_parse_key()` with 7 cascading regex patterns including: "is D minor", "is in C# major", "in the key of A minor", shorthand "Dm"/"Am", standalone note+mode, and key-related word proximity matching
+- **Fix:** Added unicode sharp/flat normalization (♯→#, ♭→b) before regex matching
+- **Fix:** Improved time signature fallback to match "4/4", "3/4" anywhere in text
+
+### Fix checkpoint path — models re-downloaded despite custom directory
+- **Bug:** When users pointed to an existing ACE-Step checkpoints folder (e.g., their main ACE-Step install), the trainer ignored it and re-downloaded ~20GB of models to its own `./checkpoints` directory
+- **Root cause:** `initialize_service()` always derived `checkpoint_dir` from `_get_project_root()` before checking if models exist. The custom dir override only happened AFTER the download checks had already run
+- **Fix:** Added `custom_checkpoint_dir` parameter to `initialize_service()` — now checks custom dir for models BEFORE falling back to download. LLM handler also searches both custom and default directories
+
+---
+
 ## 2026-02-16c — Fix Auto-Label + Split Audio
 
 ### Fix auto-label "Model not initialized" after LLM download
