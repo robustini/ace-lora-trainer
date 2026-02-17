@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-02-16c — Fix Auto-Label + Split Audio
+
+### Fix auto-label "Model not initialized" after LLM download
+- **Bug:** After downloading & loading the LLM, clicking "Auto-Label All" failed with "Failed to convert audio to codes: Model not initialized" because `convert_src_audio_to_codes()` needs the VAE (loaded only with lazy init, not at startup)
+- **Fix:** `auto_label_samples()` now calls `dit_handler.ensure_models_loaded()` to auto-load VAE + text encoder before labeling — same pattern as preprocessing
+
+### Fix split audio `[WinError 2]` — ffmpeg not found
+- **Bug:** Split audio used `pydub.AudioSegment` which requires `ffmpeg`/`ffprobe` binaries on the system PATH
+- **Fix:** Replaced `pydub` with `torchaudio` + `soundfile` (both already dependencies) — no external binary needed
+
+---
+
 ## 2026-02-16b — Captioner: Fix OOM + Missing Key/Genre
 
 ### Fix OOM on large batches (60+ files)

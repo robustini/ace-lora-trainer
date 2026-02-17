@@ -421,6 +421,8 @@ def split_audio_files(
 ) -> str:
     """Split audio files into shorter segments for faster training.
 
+    Uses torchaudio + soundfile (no ffmpeg required).
+
     Args:
         input_dir: Directory containing audio files
         output_dir: Directory to save split segments
@@ -456,46 +458,42 @@ def split_audio_files(
 
     progress(0.1, desc=f"Found {len(audio_files)} audio files...")
 
-    try:
-        from pydub import AudioSegment
-    except ImportError:
-        return "❌ pydub not installed. Run: pip install pydub"
+    import torchaudio
+    import soundfile as sf
 
     total_segments = 0
     processed_files = 0
-    segment_ms = segment_duration * 1000  # Convert to milliseconds
 
     for i, audio_path in enumerate(audio_files):
         try:
             progress((i + 1) / len(audio_files), desc=f"Processing {Path(audio_path).name}...")
 
-            # Load audio
-            audio = AudioSegment.from_file(audio_path)
-            duration_ms = len(audio)
+            # Load audio with torchaudio (handles mp3, wav, flac, ogg natively)
+            waveform, sr = torchaudio.load(audio_path)
+            total_samples = waveform.shape[1]
+            segment_samples = segment_duration * sr
+            min_samples = 10 * sr  # Minimum 10 seconds
 
-            # Get base filename without extension
             base_name = Path(audio_path).stem
-
-            # Split into segments
             segment_idx = 0
-            start_ms = 0
+            start = 0
 
-            while start_ms < duration_ms:
-                end_ms = min(start_ms + segment_ms, duration_ms)
+            while start < total_samples:
+                end = min(start + segment_samples, total_samples)
 
                 # Only save if segment is at least 10 seconds
-                if (end_ms - start_ms) >= 10000:
-                    segment = audio[start_ms:end_ms]
+                if (end - start) >= min_samples:
+                    segment = waveform[:, start:end]
 
-                    # Save segment
                     segment_filename = f"{base_name}_seg{segment_idx:02d}.wav"
                     segment_path = os.path.join(output_dir, segment_filename)
-                    segment.export(segment_path, format="wav")
+                    # Save as WAV using soundfile (no ffmpeg needed)
+                    sf.write(segment_path, segment.numpy().T, sr)
 
                     total_segments += 1
                     segment_idx += 1
 
-                start_ms = end_ms
+                start = end
 
             processed_files += 1
 
@@ -647,6 +645,14 @@ def auto_label_samples(skip_metas: bool, only_unlabeled: bool, builder_state, pr
 
     if llm_handler is None or not llm_handler.llm_initialized:
         return builder_state.get_samples_dataframe_data(), "❌ LLM not loaded. Click 'Download & Enable AI Labeling' first, or use CSV metadata / manual labeling instead.", builder_state, get_status_html()
+
+    # Auto-labeling needs VAE (audio→codes) + text_encoder.
+    # If only DiT was loaded (lazy init), load remaining models now.
+    progress(0.05, desc="Ensuring VAE & text encoder are loaded...")
+    try:
+        dit_handler.ensure_models_loaded()
+    except Exception as e:
+        return builder_state.get_samples_dataframe_data(), f"❌ Failed to load models: {e}", builder_state, get_status_html()
 
     def progress_callback(msg):
         progress(0.5, desc=msg)
