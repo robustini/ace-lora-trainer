@@ -256,6 +256,23 @@ class TrainingConfig:
     # quality results before we start tracking the best weights.
     auto_save_best_after: int = 200
 
+    # ── Sample inference during training ──
+    # When enabled, generates test audio at regular epoch intervals so
+    # you can hear how the model evolves (loss alone can't tell you quality).
+    sample_enabled: bool = False
+    sample_every_n_epochs: int = 0  # 0 = same as save_every_n_epochs
+    sample_prompt: str = ""  # Style/genre description
+    sample_lyrics: str = ""  # Optional lyrics
+    sample_bpm: int = 120
+    sample_key: str = ""  # e.g., "D Minor"
+    sample_time_signature: str = "4"
+    sample_duration: float = 30.0  # seconds (shorter = faster + less VRAM)
+    sample_strengths: str = "1.0"  # comma-separated LoRA strengths
+    sample_inference_steps: int = 0  # 0 = use training config's num_inference_steps
+    sample_guidance_scale: float = 0.0  # 0 = use training config's guidance_scale
+    sample_shift: float = 0.0  # 0 = use training config's shift
+    sample_seed: int = 42  # fixed seed for consistency across epochs
+
     # Logging
     log_every_n_steps: int = 10
 

@@ -1124,6 +1124,10 @@ def start_training(
     adapter_type_val,
     lokr_factor_val, lokr_linear_dim_val, lokr_linear_alpha_val,
     lokr_decompose_both_val, lokr_use_tucker_val, lokr_dropout_val,
+    sample_enabled_val, sample_every_n_val, sample_prompt_val, sample_lyrics_val,
+    sample_bpm_val, sample_key_val, sample_time_sig_val, sample_duration_val,
+    sample_strengths_val, sample_inf_steps_val, sample_guidance_val, sample_shift_val,
+    sample_seed_val,
     training_state,
     progress=gr.Progress(),
 ):
@@ -1225,6 +1229,20 @@ def start_training(
             attention_type=str(attention_type_val) if attention_type_val else "both",
             gradient_checkpointing=bool(gradient_checkpointing_flag),
             encoder_offloading=bool(encoder_offloading_flag),
+            # Sample inference during training
+            sample_enabled=bool(sample_enabled_val),
+            sample_every_n_epochs=int(sample_every_n_val) if sample_every_n_val else 0,
+            sample_prompt=str(sample_prompt_val or ""),
+            sample_lyrics=str(sample_lyrics_val or ""),
+            sample_bpm=int(sample_bpm_val) if sample_bpm_val else 120,
+            sample_key=str(sample_key_val or ""),
+            sample_time_signature=str(sample_time_sig_val or "4"),
+            sample_duration=float(sample_duration_val) if sample_duration_val else 30.0,
+            sample_strengths=str(sample_strengths_val or "1.0"),
+            sample_inference_steps=int(sample_inf_steps_val) if sample_inf_steps_val else 0,
+            sample_guidance_scale=float(sample_guidance_val) if sample_guidance_val else 0.0,
+            sample_shift=float(sample_shift_val) if sample_shift_val else 0.0,
+            sample_seed=int(sample_seed_val) if sample_seed_val else 42,
         )
 
         log_lines = []
@@ -2257,6 +2275,41 @@ def create_ui():
                         lora_output_dir = gr.Textbox(label="Output Dir", value="./lora_output", scale=4)
                         lora_output_picker = gr.Button("📁", scale=0, min_width=45)
 
+            # Sample inference during training
+            with gr.Accordion("🎵 Sample Inference During Training", open=False):
+                gr.HTML("""
+                <div style="padding:8px 12px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.2);border-radius:8px;margin-bottom:10px">
+                    <span style="font-size:12px;color:#2563eb">
+                        <b>🎵 Hear your model evolve!</b> — Generate test audio at regular epoch intervals
+                        so you can monitor quality during training. Loss curves alone can't tell you
+                        if the model sounds good. Samples are saved to <code>output_dir/samples/</code>.
+                    </span>
+                </div>
+                """)
+                sample_enabled = gr.Checkbox(label="Enable sample generation during training", value=False)
+                with gr.Group(visible=False) as sample_params_group:
+                    with gr.Row(elem_classes="compact-row"):
+                        sample_every_n = gr.Number(label="Sample Every N Epochs", value=0, precision=0, info="0 = same as Save Every N Epochs")
+                        sample_duration = gr.Number(label="Duration (seconds)", value=30, precision=0, info="Shorter = faster + less VRAM")
+                        sample_seed = gr.Number(label="Seed", value=42, precision=0, info="Fixed seed for consistent comparison across epochs")
+                    sample_prompt = gr.Textbox(label="Style / Genre Prompt", placeholder="e.g., electronic pop, synth-pop, energetic", info="Describe the style you're training for")
+                    sample_lyrics = gr.Textbox(label="Lyrics (optional)", placeholder="[Verse]\\nLa la la...", lines=3, info="Leave empty for instrumental")
+                    with gr.Row(elem_classes="compact-row"):
+                        sample_bpm = gr.Number(label="BPM", value=120, precision=0)
+                        sample_key = gr.Textbox(label="Key", value="", placeholder="e.g., D Minor")
+                        sample_time_sig = gr.Textbox(label="Time Sig", value="4", placeholder="4")
+                    sample_strengths = gr.Textbox(label="LoRA Strengths (comma-separated)", value="0.5, 1.0, 1.5", info="Generate one sample per strength value. 0.0 = base model, 1.0 = full LoRA")
+                    with gr.Row(elem_classes="compact-row"):
+                        sample_inf_steps = gr.Number(label="Inference Steps", value=0, precision=0, info="0 = use training config")
+                        sample_guidance = gr.Number(label="Guidance Scale", value=0, info="0 = use training config")
+                        sample_shift = gr.Number(label="Shift", value=0, info="0 = use training config")
+
+                sample_enabled.change(
+                    fn=lambda x: gr.update(visible=x),
+                    inputs=[sample_enabled],
+                    outputs=[sample_params_group],
+                )
+
             # Resume from checkpoint
             with gr.Accordion("🔄 Resume from Checkpoint", open=False):
                 resume_enabled = gr.Checkbox(label="Resume training from a saved checkpoint", value=False)
@@ -2547,6 +2600,10 @@ def create_ui():
                 adapter_type,
                 lokr_factor, lokr_linear_dim, lokr_linear_alpha,
                 lokr_decompose_both, lokr_use_tucker, lokr_dropout,
+                sample_enabled, sample_every_n, sample_prompt, sample_lyrics,
+                sample_bpm, sample_key, sample_time_sig, sample_duration,
+                sample_strengths, sample_inf_steps, sample_guidance, sample_shift,
+                sample_seed,
                 training_state,
             ],
             outputs=[training_progress, training_log, training_loss_plot, training_state, status_bar],

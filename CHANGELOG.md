@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-02-18a — Sample Inference During Training + Fix Gradient Checkpointing Crash
+
+### Auto sample inference during training (Issue #2)
+- **New feature:** Generate test audio at regular epoch intervals so you can hear how the model evolves during training — loss curves alone can't tell you if the model sounds good
+- **Configurable:** Enable/disable toggle, sample every N epochs, prompt, lyrics, BPM, key, time signature, duration, seed
+- **Multiple LoRA strengths:** Comma-separated (e.g., "0.5, 1.0, 1.5") — generates one sample per strength per interval
+- **Inference params:** Steps, guidance scale, shift (0 = use training config defaults)
+- **VRAM-safe:** Graceful OOM handling — if sample generation fails due to VRAM, logs a warning and continues training
+- **Output:** Saved to `<output_dir>/samples/epoch_<N>/strength_<S>.wav`
+- **New UI section:** "🎵 Sample Inference During Training" accordion in the training tab
+
+### Fix gradient checkpointing crash (Issue #3)
+- **Bug:** Training crashed immediately with `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn` when gradient checkpointing was enabled
+- **Root cause:** PEFT + gradient checkpointing requires `enable_input_require_grads()` on the PEFT model before `gradient_checkpointing_enable()`. Without it, checkpointed layers see inputs without `requires_grad=True` and produce a loss with no grad_fn
+- **Fix:** Added `enable_input_require_grads()` call before gradient checkpointing is enabled
+
+---
+
 ## 2026-02-17a — Fix Captioner OOM, Key/Scale, and Checkpoint Path
 
 ### Fix captioner OOM on 32GB GPUs

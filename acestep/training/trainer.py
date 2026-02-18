@@ -578,6 +578,122 @@ class LoRATrainer:
                 epoch, global_step, output_dir,
             )
 
+    def _generate_samples(self, epoch: int) -> Generator[Tuple[int, float, str], None, None]:
+        """Generate sample audio during training to monitor quality.
+
+        Temporarily switches to eval mode, loads VAE if needed, generates
+        audio at each configured LoRA strength, saves WAV files, then
+        resumes training mode.
+
+        Args:
+            epoch: Current epoch number (1-based, used for folder naming)
+
+        Yields:
+            (step, loss, status_message) tuples for progress reporting
+        """
+        cfg = self.training_config
+
+        # Parse strengths
+        try:
+            strengths = [float(s.strip()) for s in cfg.sample_strengths.split(",") if s.strip()]
+        except ValueError:
+            strengths = [1.0]
+        if not strengths:
+            strengths = [1.0]
+
+        # Resolve inference params (0 = use training config defaults)
+        inf_steps = cfg.sample_inference_steps or cfg.num_inference_steps
+        guidance = cfg.sample_guidance_scale or cfg.guidance_scale
+        shift = cfg.sample_shift or cfg.shift
+        duration = cfg.sample_duration or 30.0
+
+        samples_dir = os.path.join(cfg.output_dir, "samples", f"epoch_{epoch}")
+        os.makedirs(samples_dir, exist_ok=True)
+
+        yield 0, 0.0, f"🎵 Generating samples at epoch {epoch} (strengths: {strengths})..."
+
+        # --- Switch to eval mode ---
+        decoder = self.module.model.decoder
+        # Unwrap Fabric wrapper for train/eval toggle
+        raw_decoder = decoder._forward_module if hasattr(decoder, '_forward_module') else decoder
+        raw_decoder.eval()
+
+        try:
+            # Ensure VAE + text_encoder are loaded for inference
+            if not self.dit_handler._models_loaded:
+                self.dit_handler.ensure_models_loaded()
+
+            import torchaudio
+
+            for strength in strengths:
+                # Set LoRA scale
+                self.dit_handler.set_lora_scale(strength)
+
+                try:
+                    with torch.no_grad():
+                        result = self.dit_handler.generate_music(
+                            captions=cfg.sample_prompt,
+                            lyrics=cfg.sample_lyrics,
+                            bpm=cfg.sample_bpm if cfg.sample_bpm > 0 else None,
+                            key_scale=cfg.sample_key,
+                            time_signature=cfg.sample_time_signature,
+                            inference_steps=inf_steps,
+                            guidance_scale=guidance,
+                            shift=shift,
+                            audio_duration=duration,
+                            use_random_seed=False,
+                            seed=cfg.sample_seed,
+                            batch_size=1,
+                            use_tiled_decode=True,
+                        )
+
+                    if result.get("success") and result.get("audios"):
+                        audio_dict = result["audios"][0]
+                        audio_tensor = audio_dict["tensor"]  # [channels, samples], CPU, float32
+                        sr = audio_dict.get("sample_rate", 48000)
+
+                        # Save WAV
+                        strength_str = f"{strength:.2f}".replace(".", "_")
+                        wav_path = os.path.join(samples_dir, f"strength_{strength_str}.wav")
+                        torchaudio.save(wav_path, audio_tensor, sr)
+
+                        yield 0, 0.0, f"🎵 Sample saved: epoch {epoch}, strength {strength:.2f}"
+                    else:
+                        error = result.get("error", "Unknown error")
+                        yield 0, 0.0, f"⚠️ Sample generation failed (strength {strength:.2f}): {error}"
+
+                except torch.cuda.OutOfMemoryError:
+                    yield 0, 0.0, f"⚠️ Sample OOM at strength {strength:.2f}, skipping (try shorter duration)"
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    yield 0, 0.0, f"⚠️ Sample error at strength {strength:.2f}: {e}"
+
+            # Reset LoRA scale to 1.0
+            self.dit_handler.set_lora_scale(1.0)
+
+        except torch.cuda.OutOfMemoryError:
+            yield 0, 0.0, "⚠️ Sample generation OOM — VAE couldn't fit in VRAM. Try shorter duration or disable sampling"
+            torch.cuda.empty_cache()
+        except Exception as e:
+            yield 0, 0.0, f"⚠️ Sample generation error: {e}"
+        finally:
+            # --- Switch back to train mode ---
+            raw_decoder.train()
+
+            # Free VAE/text_encoder VRAM if encoder offloading is enabled
+            if cfg.encoder_offloading:
+                for attr_name in ('vae', 'text_encoder', 'encoder', 'tokenizer'):
+                    component = getattr(self.dit_handler.model, attr_name, None)
+                    if component is not None and hasattr(component, 'to'):
+                        try:
+                            component.to('cpu')
+                        except Exception:
+                            pass
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
     def _train_with_fabric(
         self,
         data_module: PreprocessedDataModule,
@@ -710,6 +826,14 @@ class LoRATrainer:
                 decoder = self.module.model.decoder
                 # Unwrap Fabric wrapper if present
                 raw_decoder = decoder._forward_module if hasattr(decoder, '_forward_module') else decoder
+
+                # PEFT + gradient checkpointing requires enable_input_require_grads()
+                # Without this, checkpointed layers see inputs without requires_grad=True
+                # and produce a loss with no grad_fn → RuntimeError at backward()
+                peft_decoder = raw_decoder
+                if hasattr(peft_decoder, 'enable_input_require_grads'):
+                    peft_decoder.enable_input_require_grads()
+
                 # Unwrap PEFT wrapper if present
                 if hasattr(raw_decoder, 'base_model') and hasattr(raw_decoder.base_model, 'model'):
                     raw_decoder = raw_decoder.base_model.model
@@ -937,6 +1061,12 @@ class LoRATrainer:
                 checkpoint_dir = os.path.join(self.training_config.output_dir, "checkpoints", f"epoch_{epoch+1}")
                 self._save_adapter_checkpoint(optimizer, scheduler, epoch + 1, global_step, checkpoint_dir)
                 yield global_step, avg_epoch_loss, f"💾 Checkpoint saved at epoch {epoch+1}"
+
+            # Generate samples at configured intervals
+            if self.training_config.sample_enabled:
+                sample_interval = self.training_config.sample_every_n_epochs or self.training_config.save_every_n_epochs
+                if (epoch + 1) % sample_interval == 0:
+                    yield from self._generate_samples(epoch + 1)
 
         # Save final model
         # If we have a best model from MA5 tracking, copy it as final.
