@@ -209,6 +209,39 @@ def sample_logit_normal_timestep(bsz, device, dtype, mu=-0.4, sigma=1.0):
     return t, r
 
 
+def compute_snr_weights(t: torch.Tensor, gamma: float = 5.0) -> torch.Tensor:
+    """Compute Min-SNR-gamma weights for flow-matching timesteps.
+
+    In flow matching, the interpolation is x_t = t*x1 + (1-t)*x0, where
+    t=0 is pure data and t=1 is pure noise.  The signal-to-noise ratio is:
+
+        SNR(t) = (1-t)^2 / t^2
+
+    Min-SNR weighting (Hang et al. 2023) down-weights easy (high-SNR,
+    low-t) timesteps while clamping the weight at gamma so that very
+    noisy timesteps don't explode:
+
+        w(t) = min(SNR(t), gamma) / SNR(t)
+             = clamp(SNR, max=gamma) / SNR
+
+    For small t (near 0), SNR is huge and w→gamma/SNR→0: easy steps
+    contribute less.  For large t (near 1), SNR≈0 and w→1: noisy steps
+    are kept as-is (capped at 1, never amplified).
+
+    Args:
+        t: Timestep tensor [B], values in (0, 1)
+        gamma: Clamping value (default 5.0, matching the paper)
+
+    Returns:
+        Weight tensor [B] in (0, 1]
+    """
+    # Clamp t away from exact 0/1 to avoid division by zero
+    t_safe = t.clamp(1e-6, 1.0 - 1e-6)
+    snr = ((1.0 - t_safe) / t_safe).pow(2)
+    weights = snr.clamp(max=gamma) / snr.clamp(min=1e-6)
+    return weights
+
+
 def apply_cfg_dropout(encoder_hidden_states, null_condition_emb, cfg_ratio=0.15):
     """Apply classifier-free guidance dropout using model's learned null embedding.
 
@@ -429,7 +462,20 @@ class PreprocessedLoRAModule(nn.Module):
 
             # Flow matching loss: predict the flow field v = x1 - x0
             flow = x1 - x0
-            diffusion_loss = F.mse_loss(decoder_outputs[0], flow)
+
+            # Per-sample MSE → [B]
+            per_sample_mse = F.mse_loss(
+                decoder_outputs[0], flow, reduction="none",
+            ).mean(dim=list(range(1, decoder_outputs[0].dim())))
+
+            # Apply Min-SNR weighting if enabled
+            if self.training_config.loss_weighting == "min_snr":
+                snr_weights = compute_snr_weights(
+                    t, gamma=self.training_config.snr_gamma,
+                ).to(per_sample_mse.dtype)
+                diffusion_loss = (per_sample_mse * snr_weights).mean()
+            else:
+                diffusion_loss = per_sample_mse.mean()
 
         # Convert loss to float32 for stable backward pass
         diffusion_loss = diffusion_loss.float()
@@ -747,6 +793,10 @@ class LoRATrainer:
         model_info += f", timestep: logit-normal(μ={self.training_config.timestep_mu}, σ={self.training_config.timestep_sigma})"
         if self.training_config.use_cfg:
             model_info += f", CFG dropout={self.training_config.cfg_dropout_prob:.0%}"
+        loss_w = getattr(self.training_config, 'loss_weighting', 'none')
+        if loss_w == "min_snr":
+            snr_g = getattr(self.training_config, 'snr_gamma', 5.0)
+            model_info += f", Min-SNR(γ={snr_g})"
         yield 0, 0.0, f"🚀 Starting training ({model_info}, precision: {resolved_precision})..."
         
         # Get dataloader
@@ -953,6 +1003,11 @@ class LoRATrainer:
         # Determine which module Fabric manages for gradient clipping
         clip_module = self.module.lycoris_net if (self.module.adapter_type == "lokr" and self.module.lycoris_net is not None) else self.module.model.decoder
 
+        # NaN/Inf detection state
+        nan_max = getattr(self.training_config, 'nan_detection_max', 10)
+        nan_consecutive = 0
+        nan_total = 0
+
         for epoch in range(start_epoch, self.training_config.max_epochs):
             epoch_loss = 0.0
             num_batches = 0
@@ -967,6 +1022,33 @@ class LoRATrainer:
                 # Forward pass
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
+
+                # ── NaN / Inf detection ──
+                if nan_max > 0 and (torch.isnan(loss) or torch.isinf(loss)):
+                    nan_consecutive += 1
+                    nan_total += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    kind = "NaN" if torch.isnan(loss) else "Inf"
+                    logger.warning(
+                        f"{kind} loss at epoch {epoch+1}, batch {batch_idx} "
+                        f"(consecutive: {nan_consecutive}/{nan_max}, total: {nan_total})"
+                    )
+                    if nan_consecutive >= nan_max:
+                        diag = (
+                            f"🛑 Training halted: {nan_consecutive} consecutive {kind} losses detected.\n"
+                            f"  Total NaN/Inf batches: {nan_total}\n"
+                            f"  Last at: epoch {epoch+1}, batch {batch_idx}\n"
+                            f"  Possible causes:\n"
+                            f"    • Learning rate too high (current: {self.training_config.learning_rate})\n"
+                            f"    • Gradient explosion (try lower max_grad_norm)\n"
+                            f"    • Data corruption in preprocessed tensors\n"
+                            f"    • fp16 overflow (try bf16 or fp32)"
+                        )
+                        yield global_step, 0.0, diag
+                        return
+                    continue  # Skip this batch
+                elif nan_max > 0:
+                    nan_consecutive = 0  # Reset on good batch
 
                 # Backward pass
                 self.fabric.backward(loss)
@@ -1260,6 +1342,11 @@ class LoRATrainer:
 
         self.module.model.decoder.train()
 
+        # NaN/Inf detection state (basic loop)
+        nan_max = getattr(self.training_config, 'nan_detection_max', 10)
+        nan_consecutive = 0
+        nan_total = 0
+
         for epoch in range(start_epoch, self.training_config.max_epochs):
             epoch_loss = 0.0
             num_batches = 0
@@ -1272,6 +1359,25 @@ class LoRATrainer:
 
                 loss = self.module.training_step(batch)
                 loss = loss / self.training_config.gradient_accumulation_steps
+
+                # ── NaN / Inf detection (basic loop) ──
+                if nan_max > 0 and (torch.isnan(loss) or torch.isinf(loss)):
+                    nan_consecutive += 1
+                    nan_total += 1
+                    optimizer.zero_grad(set_to_none=True)
+                    kind = "NaN" if torch.isnan(loss) else "Inf"
+                    logger.warning(f"{kind} loss at epoch {epoch+1} (consecutive: {nan_consecutive}/{nan_max})")
+                    if nan_consecutive >= nan_max:
+                        diag = (
+                            f"🛑 Training halted: {nan_consecutive} consecutive {kind} losses.\n"
+                            f"  Total NaN/Inf batches: {nan_total}\n"
+                            f"  Possible causes: LR too high, gradient explosion, data corruption, fp16 overflow"
+                        )
+                        yield global_step, 0.0, diag
+                        return
+                    continue
+                elif nan_max > 0:
+                    nan_consecutive = 0
 
                 if scaler is not None:
                     scaler.scale(loss).backward()

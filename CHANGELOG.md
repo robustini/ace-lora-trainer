@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-02-22b — Min-SNR Loss Weighting, NaN Detection, Audio Normalization
+
+### Min-SNR Loss Weighting (from Side-Step / Hang et al. 2023)
+- **New option:** `loss_weighting = "min_snr"` in TrainingConfig — applies Min-SNR-gamma weighting to per-timestep loss
+- **How it works:** Computes `SNR(t) = (1-t)^2 / t^2` for flow-matching timesteps, then weights loss by `clamp(SNR, max=gamma) / SNR`. Easy (high-SNR, low-t) timesteps contribute less, while noisy timesteps are capped at `gamma`
+- **Configurable:** `snr_gamma` parameter (default 5.0, matching the paper) controls the clamping value
+- **UI:** New "Loss Weighting" dropdown and "SNR Gamma" slider in the Advanced: Timestep & CFG section
+- **Compatible with:** Both Fabric and basic training loops
+
+### NaN / Inf Detection & Auto-Halt
+- **New feature:** Automatically detects NaN or Infinity losses during training and halts after N consecutive bad batches
+- **Configurable:** `nan_detection_max` parameter (default 10, 0=disabled). Set via "NaN Halt Threshold" in the UI
+- **Diagnostics:** When training halts, prints detailed diagnostics: consecutive count, total count, last epoch/batch, possible causes (LR too high, gradient explosion, data corruption, fp16 overflow)
+- **Graceful recovery:** Bad batches are skipped (gradients zeroed), training continues if within threshold. Counter resets on any good batch
+- **Both loops:** Implemented in both Fabric and basic (non-Fabric) training loops
+
+### Audio Normalization During Preprocessing
+- **New option:** Normalize audio loudness before VAE encoding during tensor preprocessing
+- **Modes:**
+  - `none` (default) — raw audio as-is
+  - `peak` — peak-normalize to -1.0 dBFS (loudest sample = 1.0)
+  - `lufs` — loudness-normalize to -14 LUFS (broadcast standard)
+  - `peak_lufs` — both: peak-normalize first, then LUFS-normalize
+- **Why:** Inconsistent volume levels across training samples can cause the model to learn volume artifacts instead of musical features. Normalizing audio before encoding ensures consistent latent representations
+- **UI:** New "Audio Normalization" dropdown in the preprocessing section
+- **Anti-clipping:** LUFS normalization includes automatic clip protection (peaks are capped at 1.0)
+- **Manifest:** Normalization mode is recorded in the manifest.json `preprocessing` section for reproducibility
+
+---
+
 ## 2026-02-22 — Side-Step Interop, Language Override, Bug Fixes
 
 ### Side-Step Config Interoperability

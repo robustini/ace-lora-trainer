@@ -273,6 +273,29 @@ class TrainingConfig:
     sample_shift: float = 0.0  # 0 = use training config's shift
     sample_seed: int = 42  # fixed seed for consistency across epochs
 
+    # ── Loss weighting ──
+    # "none" = standard unweighted MSE (default)
+    # "min_snr" = Min-SNR-gamma weighting (from "Efficient Diffusion Training
+    #   via Min-SNR Weighting Strategy", Hang et al. 2023).
+    #   Weights per-timestep loss by min(SNR, gamma) / SNR, reducing the
+    #   contribution of easy-to-predict (high-SNR) timesteps while clamping
+    #   the weight at gamma to avoid exploding gradients for noisy timesteps.
+    loss_weighting: str = "none"  # "none" or "min_snr"
+    snr_gamma: float = 5.0  # Clamping value for Min-SNR (5.0 recommended)
+
+    # ── NaN / Inf detection ──
+    # Automatically detect NaN or Inf losses during training and halt if
+    # too many consecutive bad batches are encountered.
+    # 0 = disabled.  10 = halt after 10 consecutive NaN/Inf losses.
+    nan_detection_max: int = 10
+
+    # ── Audio normalization during preprocessing ──
+    # "none" = no normalization (default, raw audio as-is)
+    # "peak" = peak-normalize to -1.0 dBFS (loudest sample = 1.0)
+    # "lufs" = loudness-normalize to -14 LUFS (broadcast standard)
+    # "peak_lufs" = both: peak-normalize first, then LUFS-normalize
+    audio_normalization: str = "none"
+
     # Logging
     log_every_n_steps: int = 10
 
@@ -341,4 +364,8 @@ class TrainingConfig:
             "log_every_n_steps": self.log_every_n_steps,
             "early_stop_patience": self.early_stop_patience,
             "auto_save_best_after": self.auto_save_best_after,
+            "loss_weighting": self.loss_weighting,
+            "snr_gamma": self.snr_gamma,
+            "nan_detection_max": self.nan_detection_max,
+            "audio_normalization": self.audio_normalization,
         }

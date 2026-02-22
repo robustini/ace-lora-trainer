@@ -29,6 +29,78 @@ from acestep.constants import SFT_GEN_PROMPT, DEFAULT_DIT_INSTRUCTION
 SUPPORTED_AUDIO_FORMATS = {'.wav', '.mp3', '.flac', '.ogg', '.opus'}
 
 
+def normalize_audio(
+    audio: torch.Tensor,
+    mode: str = "peak",
+    target_peak_db: float = -1.0,
+    target_lufs: float = -14.0,
+    sample_rate: int = 48000,
+) -> torch.Tensor:
+    """Normalize audio loudness.
+
+    Args:
+        audio: Tensor of shape [C, T] (channels, time samples)
+        mode: Normalization mode:
+            - "peak": Peak-normalize so the loudest sample reaches target_peak_db
+            - "lufs": Loudness-normalize to target LUFS (ITU-R BS.1770-4)
+            - "peak_lufs": Peak-normalize first, then LUFS-normalize
+        target_peak_db: Target peak level in dBFS (default -1.0)
+        target_lufs: Target integrated LUFS (default -14.0, broadcast standard)
+        sample_rate: Audio sample rate (needed for LUFS computation)
+
+    Returns:
+        Normalized audio tensor [C, T]
+    """
+    if mode == "none" or not mode:
+        return audio
+
+    def _peak_normalize(x, target_db=-1.0):
+        peak = x.abs().max()
+        if peak < 1e-8:
+            return x  # Silence — skip
+        target_linear = 10.0 ** (target_db / 20.0)
+        return x * (target_linear / peak)
+
+    def _measure_lufs(x, sr):
+        """Simplified ITU-R BS.1770 LUFS measurement.
+
+        Uses a basic K-weighted power measurement. For full compliance
+        you'd need proper K-frequency-weighting filters, but this
+        simplified version is sufficient for training normalization.
+        """
+        # Mean square across all channels
+        mean_sq = x.pow(2).mean()
+        if mean_sq < 1e-10:
+            return -100.0  # Silence
+        # LUFS ≈ -0.691 + 10*log10(mean_square)  (simplified K-weighting)
+        return -0.691 + 10.0 * torch.log10(mean_sq).item()
+
+    def _lufs_normalize(x, sr, target=-14.0):
+        current_lufs = _measure_lufs(x, sr)
+        if current_lufs < -70.0:
+            return x  # Too quiet / silence — skip
+        gain_db = target - current_lufs
+        gain_linear = 10.0 ** (gain_db / 20.0)
+        normalized = x * gain_linear
+        # Prevent clipping after LUFS normalization
+        peak = normalized.abs().max()
+        if peak > 1.0:
+            normalized = normalized / peak
+        return normalized
+
+    if mode == "peak":
+        return _peak_normalize(audio, target_peak_db)
+    elif mode == "lufs":
+        return _lufs_normalize(audio, sample_rate, target_lufs)
+    elif mode == "peak_lufs":
+        audio = _peak_normalize(audio, target_peak_db)
+        audio = _lufs_normalize(audio, sample_rate, target_lufs)
+        return audio
+    else:
+        logger.warning(f"Unknown normalization mode: {mode}, skipping")
+        return audio
+
+
 def tiled_vae_encode(
     vae,
     audio: torch.Tensor,
@@ -992,6 +1064,7 @@ class DatasetBuilder:
         output_dir: str,
         max_duration: float = 240.0,
         progress_callback=None,
+        audio_normalization: str = "none",
     ) -> Tuple[List[str], str]:
         """Preprocess all labeled samples to tensor files for efficient training.
         
@@ -1082,7 +1155,15 @@ class DatasetBuilder:
                 max_samples = int(max_duration * target_sample_rate)
                 if audio.shape[1] > max_samples:
                     audio = audio[:, :max_samples]
-                
+
+                # Apply audio normalization before VAE encoding
+                if audio_normalization and audio_normalization != "none":
+                    audio = normalize_audio(
+                        audio,
+                        mode=audio_normalization,
+                        sample_rate=target_sample_rate,
+                    )
+
                 # Add batch dimension: [2, T] -> [1, 2, T]
                 audio = audio.unsqueeze(0).to(device).to(vae.dtype)
                 
@@ -1269,6 +1350,7 @@ class DatasetBuilder:
                 "max_duration": max_duration,
                 "target_sample_rate": target_sample_rate,
                 "genre_ratio": genre_ratio,
+                "audio_normalization": audio_normalization,
             },
         }
         manifest_path = os.path.join(output_dir, "manifest.json")

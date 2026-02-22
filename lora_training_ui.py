@@ -806,6 +806,7 @@ def save_dataset(save_path: str, dataset_name: str, custom_tag: str, tag_positio
 def preprocess_dataset(
     output_dir: str, max_duration: float,
     custom_tag: str, tag_position: str,
+    audio_norm_mode: str,
     builder_state, progress=gr.Progress(),
 ) -> Tuple[str, str]:
     """Preprocess dataset to tensors.
@@ -864,11 +865,17 @@ def preprocess_dataset(
 
     progress(0.2, desc="Starting preprocessing...")
 
+    # Resolve audio normalization mode
+    norm_mode = audio_norm_mode.strip().lower() if audio_norm_mode else "none"
+    if norm_mode in ("none", "no", ""):
+        norm_mode = "none"
+
     output_paths, status = builder_state.preprocess_to_tensors(
         dit_handler=dit_handler,
         output_dir=output_dir.strip(),
         max_duration=max_duration,
         progress_callback=progress_callback,
+        audio_normalization=norm_mode,
     )
 
     workflow_state["tensors_ready"] = len(output_paths) > 0
@@ -1136,6 +1143,7 @@ def start_training(
     sample_bpm_val, sample_key_val, sample_time_sig_val, sample_duration_val,
     sample_strengths_val, sample_inf_steps_val, sample_guidance_val, sample_shift_val,
     sample_seed_val,
+    loss_weighting_val, snr_gamma_val, nan_detection_max_val,
     training_state,
     progress=gr.Progress(),
 ):
@@ -1251,6 +1259,10 @@ def start_training(
             sample_guidance_scale=float(sample_guidance_val) if sample_guidance_val else 0.0,
             sample_shift=float(sample_shift_val) if sample_shift_val else 0.0,
             sample_seed=int(sample_seed_val) if sample_seed_val else 42,
+            # Loss weighting & NaN detection
+            loss_weighting=str(loss_weighting_val) if loss_weighting_val else "none",
+            snr_gamma=float(snr_gamma_val) if snr_gamma_val else 5.0,
+            nan_detection_max=int(nan_detection_max_val) if nan_detection_max_val else 10,
         )
 
         log_lines = []
@@ -2193,6 +2205,15 @@ def create_ui():
                 preprocess_dir_picker = gr.Button("📁", scale=0, min_width=45)
                 max_duration_slider = gr.Slider(60, 600, 240, step=30, label="Max Duration (s)", scale=2)
 
+            with gr.Row(elem_classes="compact-row"):
+                audio_norm_dropdown = gr.Dropdown(
+                    choices=["none", "peak", "lufs", "peak_lufs"],
+                    value="none",
+                    label="Audio Normalization",
+                    info="Normalize audio loudness before encoding. 'peak'=-1dBFS, 'lufs'=-14 LUFS, 'peak_lufs'=both",
+                    scale=2,
+                )
+
             preprocess_btn = gr.Button("⚡ Start Preprocessing", variant="primary", size="lg", elem_classes="primary-action")
             preprocess_progress = gr.Textbox(label="Progress", interactive=False, lines=3)
 
@@ -2306,6 +2327,19 @@ def create_ui():
                             timestep_sigma = gr.Slider(0.1, 3.0, 1.0, step=0.1, label="Timestep σ (sigma)", info="Logit-normal spread. 1.0 = moderate spread (default)")
                         with gr.Row(elem_classes="compact-row"):
                             cfg_dropout_prob = gr.Slider(0.0, 0.5, 0.15, step=0.05, label="CFG Dropout", info="Probability of dropping condition (uses model's null embedding). 0.15 = 15% (default). Applied to ALL model types.")
+
+                        gr.HTML('<div style="padding:6px 10px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);border-radius:8px;margin:12px 0 8px 0"><span style="font-size:12px;color:#16a34a">⚖️ <b>Loss Weighting & Safety</b></span></div>')
+                        with gr.Row(elem_classes="compact-row"):
+                            loss_weighting = gr.Dropdown(
+                                choices=["none", "min_snr"],
+                                value="none",
+                                label="Loss Weighting",
+                                info="'min_snr' = Min-SNR-gamma: down-weights easy timesteps for more stable training",
+                                scale=2,
+                            )
+                            snr_gamma = gr.Slider(1.0, 20.0, 5.0, step=1.0, label="SNR Gamma", info="Clamping value for Min-SNR. 5.0 recommended (paper default)", scale=2)
+                        with gr.Row(elem_classes="compact-row"):
+                            nan_detection_max = gr.Number(label="NaN Halt Threshold", value=10, precision=0, info="Halt training after N consecutive NaN/Inf losses. 0=disabled.", scale=2)
 
                     # Base model parameters — hidden by default, shown when base model detected
                     base_params_group = gr.Group(visible=False)
@@ -2537,13 +2571,13 @@ def create_ui():
         # Profiles
         profile_save_btn.click(
             fn=save_profile_config,
-            inputs=[profile_path, dataset_builder_state, custom_ckpt_dir, checkpoint_dropdown, split_input_dir, split_output_dir, split_duration, audio_directory, load_dataset_path, dataset_name, custom_tag, tag_position, all_instrumental, genre_ratio, skip_metas, only_unlabeled, save_path, preprocess_output_dir, max_duration_slider, gpu_preset, training_tensor_dir, adapter_type, lora_rank, lora_alpha, lora_dropout, lokr_factor, lokr_linear_dim, lokr_linear_alpha, lokr_decompose_both, lokr_use_tucker, lokr_dropout, learning_rate, max_epochs, batch_size, gradient_accumulation, optimizer_type, scheduler_type, attention_type, model_type_radio, shift, seed, timestep_mu, timestep_sigma, cfg_dropout_prob, guidance_scale, num_inference_steps, save_every_n_epochs, early_stop_enabled, early_stop_patience_val, auto_save_best_after, max_latent_length, gradient_checkpointing_enabled, encoder_offloading_enabled, torch_compile_enabled, lora_output_dir, sample_enabled, sample_every_n, sample_prompt, sample_lyrics, sample_bpm, sample_key, sample_time_sig, sample_duration, sample_strengths, sample_inf_steps, sample_guidance, sample_shift, sample_seed, resume_enabled, resume_dir, resume_checkpoint_dropdown, estimate_tensor_dir, estimate_batches, estimate_granularity, estimate_top_k, export_path, merge_base_model, merge_lora_dir, merge_checkpoint_dropdown, merge_output_dir],
+            inputs=[profile_path, dataset_builder_state, custom_ckpt_dir, checkpoint_dropdown, split_input_dir, split_output_dir, split_duration, audio_directory, load_dataset_path, dataset_name, custom_tag, tag_position, all_instrumental, genre_ratio, skip_metas, only_unlabeled, save_path, preprocess_output_dir, max_duration_slider, gpu_preset, training_tensor_dir, adapter_type, lora_rank, lora_alpha, lora_dropout, lokr_factor, lokr_linear_dim, lokr_linear_alpha, lokr_decompose_both, lokr_use_tucker, lokr_dropout, learning_rate, max_epochs, batch_size, gradient_accumulation, optimizer_type, scheduler_type, attention_type, model_type_radio, shift, seed, timestep_mu, timestep_sigma, cfg_dropout_prob, guidance_scale, num_inference_steps, save_every_n_epochs, early_stop_enabled, early_stop_patience_val, auto_save_best_after, max_latent_length, gradient_checkpointing_enabled, encoder_offloading_enabled, torch_compile_enabled, lora_output_dir, sample_enabled, sample_every_n, sample_prompt, sample_lyrics, sample_bpm, sample_key, sample_time_sig, sample_duration, sample_strengths, sample_inf_steps, sample_guidance, sample_shift, sample_seed, loss_weighting, snr_gamma, nan_detection_max, audio_norm_dropdown, resume_enabled, resume_dir, resume_checkpoint_dropdown, estimate_tensor_dir, estimate_batches, estimate_granularity, estimate_top_k, export_path, merge_base_model, merge_lora_dir, merge_checkpoint_dropdown, merge_output_dir],
             outputs=[profile_status],
         )
         profile_load_btn.click(
             fn=load_profile_config,
             inputs=[profile_path],
-            outputs=[profile_status, audio_files_table, sample_selector, dataset_builder_state, status_bar, custom_ckpt_dir, checkpoint_dropdown, split_input_dir, split_output_dir, split_duration, audio_directory, load_dataset_path, dataset_name, custom_tag, tag_position, all_instrumental, genre_ratio, skip_metas, only_unlabeled, save_path, preprocess_output_dir, max_duration_slider, gpu_preset, training_tensor_dir, adapter_type, lora_rank, lora_alpha, lora_dropout, lokr_factor, lokr_linear_dim, lokr_linear_alpha, lokr_decompose_both, lokr_use_tucker, lokr_dropout, learning_rate, max_epochs, batch_size, gradient_accumulation, optimizer_type, scheduler_type, attention_type, model_type_radio, shift, seed, timestep_mu, timestep_sigma, cfg_dropout_prob, guidance_scale, num_inference_steps, save_every_n_epochs, early_stop_enabled, early_stop_patience_val, auto_save_best_after, max_latent_length, gradient_checkpointing_enabled, encoder_offloading_enabled, torch_compile_enabled, lora_output_dir, sample_enabled, sample_every_n, sample_prompt, sample_lyrics, sample_bpm, sample_key, sample_time_sig, sample_duration, sample_strengths, sample_inf_steps, sample_guidance, sample_shift, sample_seed, resume_enabled, resume_dir, resume_checkpoint_dropdown, estimate_tensor_dir, estimate_batches, estimate_granularity, estimate_top_k, export_path, merge_base_model, merge_lora_dir, merge_checkpoint_dropdown, merge_output_dir, lora_settings_group, lokr_settings_group, sample_params_group, base_params_group, scan_status],
+            outputs=[profile_status, audio_files_table, sample_selector, dataset_builder_state, status_bar, custom_ckpt_dir, checkpoint_dropdown, split_input_dir, split_output_dir, split_duration, audio_directory, load_dataset_path, dataset_name, custom_tag, tag_position, all_instrumental, genre_ratio, skip_metas, only_unlabeled, save_path, preprocess_output_dir, max_duration_slider, gpu_preset, training_tensor_dir, adapter_type, lora_rank, lora_alpha, lora_dropout, lokr_factor, lokr_linear_dim, lokr_linear_alpha, lokr_decompose_both, lokr_use_tucker, lokr_dropout, learning_rate, max_epochs, batch_size, gradient_accumulation, optimizer_type, scheduler_type, attention_type, model_type_radio, shift, seed, timestep_mu, timestep_sigma, cfg_dropout_prob, guidance_scale, num_inference_steps, save_every_n_epochs, early_stop_enabled, early_stop_patience_val, auto_save_best_after, max_latent_length, gradient_checkpointing_enabled, encoder_offloading_enabled, torch_compile_enabled, lora_output_dir, sample_enabled, sample_every_n, sample_prompt, sample_lyrics, sample_bpm, sample_key, sample_time_sig, sample_duration, sample_strengths, sample_inf_steps, sample_guidance, sample_shift, sample_seed, loss_weighting, snr_gamma, nan_detection_max, audio_norm_dropdown, resume_enabled, resume_dir, resume_checkpoint_dropdown, estimate_tensor_dir, estimate_batches, estimate_granularity, estimate_top_k, export_path, merge_base_model, merge_lora_dir, merge_checkpoint_dropdown, merge_output_dir, lora_settings_group, lokr_settings_group, sample_params_group, base_params_group, scan_status],
         )
 
         # Side-Step Interop
@@ -2625,7 +2659,7 @@ def create_ui():
         # Preprocessing (custom_tag + tag_position read directly from UI for failsafe)
         preprocess_btn.click(
             fn=preprocess_dataset,
-            inputs=[preprocess_output_dir, max_duration_slider, custom_tag, tag_position, dataset_builder_state],
+            inputs=[preprocess_output_dir, max_duration_slider, custom_tag, tag_position, audio_norm_dropdown, dataset_builder_state],
             outputs=[preprocess_progress, status_bar],
         )
 
@@ -2717,6 +2751,7 @@ def create_ui():
                 sample_bpm, sample_key, sample_time_sig, sample_duration,
                 sample_strengths, sample_inf_steps, sample_guidance, sample_shift,
                 sample_seed,
+                loss_weighting, snr_gamma, nan_detection_max,
                 training_state,
             ],
             outputs=[training_progress, training_log, training_loss_plot, training_state, status_bar],
@@ -2811,6 +2846,10 @@ PROFILE_KEYS = [
     "sample_guidance",
     "sample_shift",
     "sample_seed",
+    "loss_weighting",
+    "snr_gamma",
+    "nan_detection_max",
+    "audio_norm_dropdown",
     "resume_enabled",
     "resume_dir",
     "resume_checkpoint_dropdown",
