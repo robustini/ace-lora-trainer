@@ -1360,5 +1360,329 @@ class DatasetBuilder:
         status = f"✅ Preprocessed {success_count}/{len(labeled_samples)} samples to {output_dir}"
         if fail_count > 0:
             status += f" ({fail_count} failed)"
-        
+
+        return output_paths, status
+
+    def preprocess_two_pass(
+        self,
+        dit_handler,
+        output_dir: str,
+        max_duration: float = 240.0,
+        progress_callback=None,
+        audio_normalization: str = "none",
+    ) -> Tuple[List[str], str]:
+        """Two-pass preprocessing for low-VRAM GPUs (8-12GB).
+
+        Splits the single-pass pipeline into two sequential passes so that
+        only one set of heavyweight models is loaded at a time:
+
+        Pass 1 — Light (~3 GB VRAM): VAE + Text Encoder
+            Encodes audio to latents, tokenises text/lyrics.
+            Saves intermediate .tmp.pt files.
+            Then offloads VAE + Text Encoder to CPU.
+
+        Pass 2 — Heavy (~6 GB VRAM): DIT Encoder
+            Loads intermediates, runs model.encoder to produce
+            encoder_hidden_states.  Saves final .pt files.
+
+        Args:
+            dit_handler: Initialized DiT handler
+            output_dir: Directory to save preprocessed .pt files
+            max_duration: Maximum audio duration in seconds
+            progress_callback: Optional callback for progress updates
+            audio_normalization: Audio normalization mode
+
+        Returns:
+            Tuple of (list of output paths, status message)
+        """
+        import gc
+        import hashlib
+        import random
+
+        if not self.samples:
+            return [], "❌ No samples to preprocess"
+
+        labeled_samples = [s for s in self.samples if s.labeled]
+        if not labeled_samples:
+            return [], "❌ No labeled samples to preprocess"
+
+        if dit_handler is None or dit_handler.model is None:
+            return [], "❌ Model not initialized."
+        if dit_handler.vae is None:
+            return [], "❌ VAE not loaded."
+        if dit_handler.text_encoder is None:
+            return [], "❌ Text encoder not loaded."
+
+        os.makedirs(output_dir, exist_ok=True)
+        tmp_dir = os.path.join(output_dir, "_tmp_pass1")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        model = dit_handler.model
+        vae = dit_handler.vae
+        text_encoder = dit_handler.text_encoder
+        text_tokenizer = dit_handler.text_tokenizer
+        silence_latent = dit_handler.silence_latent
+        device = dit_handler.device
+        dtype = dit_handler.dtype
+        target_sample_rate = 48000
+
+        # Genre ratio
+        genre_ratio = self.metadata.genre_ratio
+        num_genre = int(len(labeled_samples) * genre_ratio / 100)
+        random.seed(42)
+        idx_list = list(range(len(labeled_samples)))
+        random.shuffle(idx_list)
+        genre_indices = set(idx_list[:num_genre])
+
+        # ────────────────────────────────────────────────
+        # Pass 1: VAE + Text Encoder (~3 GB VRAM)
+        # ────────────────────────────────────────────────
+        if progress_callback:
+            progress_callback("🔄 Pass 1/2: VAE + Text Encoder (light, ~3GB)...")
+
+        pass1_paths = []
+        p1_success = 0
+        p1_fail = 0
+
+        for i, sample in enumerate(labeled_samples):
+            try:
+                if progress_callback:
+                    progress_callback(f"Pass 1 [{i+1}/{len(labeled_samples)}]: {sample.filename}")
+
+                use_genre = i in genre_indices
+
+                # Load audio
+                audio, sr = torchaudio.load(sample.audio_path)
+                if sr != target_sample_rate:
+                    resampler = torchaudio.transforms.Resample(sr, target_sample_rate)
+                    audio = resampler(audio)
+                if audio.shape[0] == 1:
+                    audio = audio.repeat(2, 1)
+                elif audio.shape[0] > 2:
+                    audio = audio[:2, :]
+                max_samples = int(max_duration * target_sample_rate)
+                if audio.shape[1] > max_samples:
+                    audio = audio[:, :max_samples]
+                if audio_normalization and audio_normalization != "none":
+                    audio = normalize_audio(audio, mode=audio_normalization, sample_rate=target_sample_rate)
+
+                audio_batch = audio.unsqueeze(0).to(device).to(vae.dtype)
+
+                # VAE encode
+                with torch.no_grad():
+                    latent = tiled_vae_encode(vae, audio_batch)
+                    target_latents = latent.transpose(1, 2).to(dtype)
+
+                latent_length = target_latents.shape[1]
+                attention_mask = torch.ones(1, latent_length, device=device, dtype=dtype)
+
+                # Text encode
+                caption = sample.get_training_prompt(self.metadata.tag_position, use_genre=use_genre)
+                metas_str = (
+                    f"- bpm: {sample.bpm if sample.bpm else 'N/A'}\n"
+                    f"- timesignature: {sample.timesignature if sample.timesignature else 'N/A'}\n"
+                    f"- keyscale: {sample.keyscale if sample.keyscale else 'N/A'}\n"
+                    f"- duration: {sample.duration} seconds\n"
+                )
+                text_prompt = SFT_GEN_PROMPT.format(DEFAULT_DIT_INSTRUCTION, caption, metas_str)
+
+                text_inputs = text_tokenizer(text_prompt, padding="max_length", max_length=256, truncation=True, return_tensors="pt")
+                text_input_ids = text_inputs.input_ids.to(device)
+                text_attention_mask = text_inputs.attention_mask.to(device).to(dtype)
+
+                with torch.no_grad():
+                    text_outputs = text_encoder(text_input_ids)
+                    text_hidden_states = text_outputs.last_hidden_state.to(dtype)
+
+                lyrics = sample.lyrics if sample.lyrics else "[Instrumental]"
+                lyric_inputs = text_tokenizer(lyrics, padding="max_length", max_length=512, truncation=True, return_tensors="pt")
+                lyric_input_ids = lyric_inputs.input_ids.to(device)
+                lyric_attention_mask = lyric_inputs.attention_mask.to(device).to(dtype)
+
+                with torch.no_grad():
+                    lyric_hidden_states = text_encoder.embed_tokens(lyric_input_ids).to(dtype)
+
+                # Build context_latents
+                src_latents = silence_latent[:, :latent_length, :].to(dtype)
+                if src_latents.shape[0] < 1:
+                    src_latents = src_latents.expand(1, -1, -1)
+                if src_latents.shape[1] < latent_length:
+                    pad_len = latent_length - src_latents.shape[1]
+                    src_latents = torch.cat([src_latents, silence_latent[:, :pad_len, :].expand(1, -1, -1).to(dtype)], dim=1)
+                elif src_latents.shape[1] > latent_length:
+                    src_latents = src_latents[:, :latent_length, :]
+                chunk_masks = torch.ones(1, latent_length, 64, device=device, dtype=dtype)
+                context_latents = torch.cat([src_latents, chunk_masks], dim=-1)
+
+                # Save intermediate (everything EXCEPT encoder_hidden_states)
+                tmp_data = {
+                    "target_latents": target_latents.squeeze(0).cpu(),
+                    "attention_mask": attention_mask.squeeze(0).cpu(),
+                    "text_hidden_states": text_hidden_states.squeeze(0).cpu(),
+                    "text_attention_mask": text_attention_mask.squeeze(0).cpu(),
+                    "lyric_hidden_states": lyric_hidden_states.squeeze(0).cpu(),
+                    "lyric_attention_mask": lyric_attention_mask.squeeze(0).cpu(),
+                    "context_latents": context_latents.squeeze(0).cpu(),
+                    "metadata": {
+                        "audio_path": sample.audio_path,
+                        "filename": sample.filename,
+                        "caption": caption,
+                        "lyrics": lyrics,
+                        "duration": sample.duration,
+                        "bpm": sample.bpm,
+                        "keyscale": sample.keyscale,
+                        "timesignature": sample.timesignature,
+                        "language": sample.language,
+                        "is_instrumental": sample.is_instrumental,
+                        "custom_tag": sample.custom_tag,
+                        "tag_position": self.metadata.tag_position,
+                    },
+                    "sample_id": sample.id,
+                }
+                tmp_path = os.path.join(tmp_dir, f"{sample.id}.tmp.pt")
+                torch.save(tmp_data, tmp_path)
+                pass1_paths.append(tmp_path)
+                p1_success += 1
+
+            except Exception as e:
+                logger.exception(f"Pass 1 error: {sample.filename}")
+                p1_fail += 1
+                if progress_callback:
+                    progress_callback(f"❌ Pass 1 failed: {sample.filename}: {e}")
+
+        if progress_callback:
+            progress_callback(f"✅ Pass 1 complete: {p1_success}/{len(labeled_samples)} samples")
+
+        # Offload VAE + text_encoder to CPU to free VRAM for Pass 2
+        for attr_name in ('vae', 'text_encoder'):
+            component = getattr(dit_handler.model, attr_name, None)
+            if component is not None and hasattr(component, 'to'):
+                try:
+                    component.to('cpu')
+                except Exception:
+                    pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if progress_callback:
+            progress_callback("📤 VAE + Text Encoder offloaded to CPU")
+
+        # ────────────────────────────────────────────────
+        # Pass 2: DIT Encoder (~6 GB VRAM)
+        # ────────────────────────────────────────────────
+        if progress_callback:
+            progress_callback("🔄 Pass 2/2: DIT Encoder (heavy, ~6GB)...")
+
+        output_paths = []
+        p2_success = 0
+        p2_fail = 0
+
+        for idx, tmp_path in enumerate(pass1_paths):
+            try:
+                if progress_callback:
+                    progress_callback(f"Pass 2 [{idx+1}/{len(pass1_paths)}]: encoding...")
+
+                tmp_data = torch.load(tmp_path, map_location='cpu')
+
+                text_hs = tmp_data["text_hidden_states"].unsqueeze(0).to(device)
+                text_am = tmp_data["text_attention_mask"].unsqueeze(0).to(device)
+                lyric_hs = tmp_data["lyric_hidden_states"].unsqueeze(0).to(device)
+                lyric_am = tmp_data["lyric_attention_mask"].unsqueeze(0).to(device)
+
+                refer_audio_hidden = torch.zeros(1, 1, 64, device=device, dtype=dtype)
+                refer_audio_order_mask = torch.zeros(1, device=device, dtype=torch.long)
+
+                with torch.no_grad():
+                    encoder_hidden_states, encoder_attention_mask = model.encoder(
+                        text_hidden_states=text_hs,
+                        text_attention_mask=text_am,
+                        lyric_hidden_states=lyric_hs,
+                        lyric_attention_mask=lyric_am,
+                        refer_audio_acoustic_hidden_states_packed=refer_audio_hidden,
+                        refer_audio_order_mask=refer_audio_order_mask,
+                    )
+
+                sample_id = tmp_data["sample_id"]
+                output_data = {
+                    "target_latents": tmp_data["target_latents"],
+                    "attention_mask": tmp_data["attention_mask"],
+                    "encoder_hidden_states": encoder_hidden_states.squeeze(0).cpu(),
+                    "encoder_attention_mask": encoder_attention_mask.squeeze(0).cpu(),
+                    "context_latents": tmp_data["context_latents"],
+                    "metadata": tmp_data["metadata"],
+                }
+
+                output_path = os.path.join(output_dir, f"{sample_id}.pt")
+                torch.save(output_data, output_path)
+                output_paths.append(output_path)
+                p2_success += 1
+
+            except Exception as e:
+                logger.exception(f"Pass 2 error: {tmp_path}")
+                p2_fail += 1
+                if progress_callback:
+                    progress_callback(f"❌ Pass 2 failed: {e}")
+
+        # Clean up temp files
+        import shutil
+        try:
+            shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
+
+        # Restore VAE + text_encoder to GPU (optional, for subsequent operations)
+        for attr_name in ('vae', 'text_encoder'):
+            component = getattr(dit_handler.model, attr_name, None)
+            if component is not None and hasattr(component, 'to'):
+                try:
+                    component.to(device)
+                except Exception:
+                    pass
+
+        # Build manifest
+        sample_entries = []
+        for p in output_paths:
+            entry = {"path": os.path.basename(p), "filename": os.path.basename(p)}
+            try:
+                entry["file_size_bytes"] = os.path.getsize(p)
+                data = torch.load(p, map_location="cpu")
+                entry["shapes"] = {k: list(v.shape) for k, v in data.items() if isinstance(v, torch.Tensor)}
+                entry["dtype"] = str(next((v.dtype for v in data.values() if isinstance(v, torch.Tensor)), "unknown"))
+                with open(p, "rb") as bf:
+                    entry["md5"] = hashlib.md5(bf.read()).hexdigest()
+                if "metadata" in data and isinstance(data["metadata"], dict):
+                    entry["sample_metadata"] = data["metadata"]
+            except Exception as e:
+                logger.warning(f"Manifest entry error: {p}: {e}")
+            sample_entries.append(entry)
+
+        relative_paths = [os.path.basename(p) for p in output_paths]
+        manifest = {
+            "version": 2,
+            "created_at": datetime.now().isoformat(),
+            "metadata": self.metadata.to_dict(),
+            "samples": relative_paths,
+            "sample_details": sample_entries,
+            "num_samples": len(output_paths),
+            "total_size_bytes": sum(e.get("file_size_bytes", 0) for e in sample_entries),
+            "preprocessing": {
+                "max_duration": max_duration,
+                "target_sample_rate": target_sample_rate,
+                "genre_ratio": self.metadata.genre_ratio,
+                "audio_normalization": audio_normalization,
+                "mode": "two_pass",
+            },
+        }
+        manifest_path = os.path.join(output_dir, "manifest.json")
+        with open(manifest_path, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2)
+
+        total = len(labeled_samples)
+        status = f"✅ Two-pass preprocessing complete: {p2_success}/{total} samples to {output_dir}"
+        if p1_fail > 0:
+            status += f" (Pass 1: {p1_fail} failed)"
+        if p2_fail > 0:
+            status += f" (Pass 2: {p2_fail} failed)"
+
         return output_paths, status

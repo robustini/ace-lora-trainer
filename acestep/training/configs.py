@@ -2,13 +2,20 @@
 Training Configuration Classes
 
 Contains dataclasses for LoRA and training configurations.
+Includes VRAM-aware presets loaded from external JSON files.
 """
 
+import json
+import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import torch
 from loguru import logger
+
+
+# Directory containing preset JSON files
+_PRESETS_DIR = os.path.join(os.path.dirname(__file__), "presets")
 
 
 def detect_best_precision() -> str:
@@ -211,7 +218,7 @@ class TrainingConfig:
     # Optimizer: "adamw" (default), "adamw8bit" (bitsandbytes), "adafactor", "prodigy"
     optimizer_type: str = "adamw"
 
-    # Scheduler: "cosine" (default), "linear", "constant", "constant_with_warmup"
+    # Scheduler: "cosine" (default), "cosine_restarts", "linear", "constant", "constant_with_warmup"
     scheduler_type: str = "cosine"
 
     # Attention targeting: "both" (default), "self", "cross"
@@ -369,3 +376,136 @@ class TrainingConfig:
             "nan_detection_max": self.nan_detection_max,
             "audio_normalization": self.audio_normalization,
         }
+
+
+# ============================================================================
+# VRAM Preset System
+# ============================================================================
+
+def list_presets() -> List[str]:
+    """List all available training preset names.
+
+    Scans the presets/ directory for JSON files.
+
+    Returns:
+        List of preset names (without .json extension), sorted alphabetically.
+    """
+    if not os.path.isdir(_PRESETS_DIR):
+        return []
+    return sorted(
+        f[:-5] for f in os.listdir(_PRESETS_DIR)
+        if f.endswith(".json") and not f.startswith("_")
+    )
+
+
+def load_preset(name: str) -> Dict[str, Any]:
+    """Load a training preset by name.
+
+    Args:
+        name: Preset name (e.g., "recommended", "vram_8gb").
+              Can also be an absolute path to a custom JSON file.
+
+    Returns:
+        Dictionary of preset parameters.
+
+    Raises:
+        FileNotFoundError: If preset not found.
+    """
+    # Allow absolute/relative paths to custom presets
+    if os.path.isfile(name):
+        path = name
+    else:
+        path = os.path.join(_PRESETS_DIR, f"{name}.json")
+
+    if not os.path.isfile(path):
+        available = list_presets()
+        raise FileNotFoundError(
+            f"Preset '{name}' not found. Available presets: {', '.join(available)}"
+        )
+
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    # Remove internal keys
+    data.pop("_description", None)
+
+    logger.info(f"Loaded training preset: {name}")
+    return data
+
+
+def apply_preset(
+    training_config: "TrainingConfig",
+    lora_config: "LoRAConfig",
+    preset_name: str,
+) -> str:
+    """Apply a preset to existing config objects.
+
+    Updates TrainingConfig and LoRAConfig in-place with values from the preset.
+    Only overwrites fields that are present in the preset JSON; other fields
+    retain their current values.
+
+    Args:
+        training_config: TrainingConfig to update.
+        lora_config: LoRAConfig to update.
+        preset_name: Name of the preset to apply.
+
+    Returns:
+        Description string from the preset.
+    """
+    # Load the raw preset (may contain _description)
+    if os.path.isfile(preset_name):
+        path = preset_name
+    else:
+        path = os.path.join(_PRESETS_DIR, f"{preset_name}.json")
+
+    with open(path, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+
+    description = raw.get("_description", f"Preset: {preset_name}")
+    data = {k: v for k, v in raw.items() if not k.startswith("_")}
+
+    # Map lora_* keys to LoRAConfig fields
+    lora_mapping = {
+        "lora_r": "r",
+        "lora_alpha": "alpha",
+        "lora_dropout": "dropout",
+    }
+
+    for key, value in data.items():
+        if key in lora_mapping:
+            setattr(lora_config, lora_mapping[key], value)
+        elif hasattr(training_config, key):
+            setattr(training_config, key, value)
+
+    logger.info(f"Applied preset '{preset_name}': {description}")
+    return description
+
+
+def auto_select_preset() -> str:
+    """Auto-select the best preset based on available GPU VRAM.
+
+    Returns:
+        Preset name string.
+    """
+    try:
+        if torch.cuda.is_available():
+            total_mb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+            vram_gb = total_mb / 1024
+        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
+            total_mb = torch.xpu.get_device_properties(0).total_memory / (1024 ** 2)
+            vram_gb = total_mb / 1024
+        else:
+            vram_gb = 0
+    except Exception:
+        vram_gb = 0
+
+    if vram_gb >= 24:
+        return "vram_24gb_plus"
+    elif vram_gb >= 16:
+        return "vram_16gb"
+    elif vram_gb >= 12:
+        return "vram_12gb"
+    elif vram_gb >= 8:
+        return "vram_8gb"
+    else:
+        return "vram_8gb"  # Fallback to most conservative

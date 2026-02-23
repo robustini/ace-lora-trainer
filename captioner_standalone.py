@@ -715,6 +715,506 @@ DEFAULT_MODEL_PATH = "ACE-Step/acestep-captioner"
 DEFAULT_TRANSCRIBER_PATH = "ACE-Step/acestep-transcriber"
 
 
+# ============================================================================
+# External Data Preparation Backends
+# (Whisper API, ElevenLabs Scribe, Gemini Audio Analysis)
+# ============================================================================
+
+class WhisperTranscriber:
+    """Transcribe lyrics using OpenAI's Whisper API.
+
+    Provides word-level timestamps and intelligent line breaking for both
+    CJK and Latin scripts. Requires an OpenAI API key.
+
+    Usage:
+        transcriber = WhisperTranscriber(api_key="sk-...")
+        lyrics, language = transcriber.transcribe("song.mp3")
+    """
+
+    def __init__(self, api_key: str, model: str = "whisper-1"):
+        self.api_key = api_key
+        self.model = model
+
+    def transcribe(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+        prompt: str = "",
+    ) -> tuple:
+        """Transcribe audio to lyrics with timestamps.
+
+        Args:
+            audio_path: Path to audio file
+            language: Optional language code (e.g. "en", "ja")
+            prompt: Optional context prompt for better accuracy
+
+        Returns:
+            Tuple of (formatted_lyrics, detected_language)
+        """
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return "❌ openai not installed. Run: pip install openai", "unknown"
+
+        client = OpenAI(api_key=self.api_key)
+
+        try:
+            with open(audio_path, "rb") as audio_file:
+                params = {
+                    "model": self.model,
+                    "file": audio_file,
+                    "response_format": "verbose_json",
+                    "timestamp_granularities": ["word"],
+                }
+                if language:
+                    params["language"] = language
+                if prompt:
+                    params["prompt"] = prompt
+
+                result = client.audio.transcriptions.create(**params)
+
+            detected_lang = getattr(result, 'language', 'unknown')
+            words = getattr(result, 'words', [])
+
+            if not words:
+                text = getattr(result, 'text', '')
+                if text:
+                    return f"[Verse]\n{text}", detected_lang
+                return "[Instrumental]", detected_lang
+
+            # Format words into lyrics lines with intelligent line breaking
+            lines = self._format_words_to_lines(words, detected_lang)
+            lyrics = "[Verse]\n" + "\n".join(lines)
+
+            return lyrics, detected_lang
+
+        except Exception as e:
+            return f"❌ Whisper API error: {str(e)}", "unknown"
+
+    @staticmethod
+    def _format_words_to_lines(words: list, language: str = "en") -> List[str]:
+        """Format word-level timestamps into natural lyrics lines.
+
+        Uses pause detection between words to determine line breaks.
+        Handles CJK scripts differently (no spaces between characters).
+
+        Args:
+            words: List of word objects with 'word', 'start', 'end'
+            language: Detected language for CJK handling
+
+        Returns:
+            List of lyric lines
+        """
+        import re
+
+        cjk_languages = {"zh", "ja", "ko", "yue", "wuu"}
+        is_cjk = language in cjk_languages
+
+        lines = []
+        current_line = []
+        last_end = 0.0
+
+        for w in words:
+            word_text = w.get('word', getattr(w, 'word', '')).strip()
+            if not word_text:
+                continue
+
+            start = w.get('start', getattr(w, 'start', 0))
+            end = w.get('end', getattr(w, 'end', 0))
+
+            # Detect pause (>0.5s for CJK, >0.8s for Latin)
+            pause_threshold = 0.5 if is_cjk else 0.8
+            if current_line and (start - last_end) > pause_threshold:
+                if is_cjk:
+                    lines.append("".join(current_line))
+                else:
+                    lines.append(" ".join(current_line))
+                current_line = []
+
+            current_line.append(word_text)
+            last_end = end
+
+        # Don't forget the last line
+        if current_line:
+            if is_cjk:
+                lines.append("".join(current_line))
+            else:
+                lines.append(" ".join(current_line))
+
+        return lines
+
+    def transcribe_directory(
+        self,
+        input_dir: str,
+        output_suffix: str = ".lyrics.txt",
+        language: Optional[str] = None,
+        progress_callback=None,
+    ) -> List[Dict]:
+        """Batch transcribe all audio files in a directory.
+
+        Saves lyrics as sidecar .lyrics.txt files.
+
+        Args:
+            input_dir: Directory containing audio files
+            output_suffix: Suffix for output files
+            language: Optional language override
+            progress_callback: Optional callback(current, total, filename)
+
+        Returns:
+            List of result dicts
+        """
+        audio_extensions = {'.mp3', '.wav', '.flac', '.ogg', '.opus'}
+        files = sorted(
+            f for f in Path(input_dir).iterdir()
+            if f.suffix.lower() in audio_extensions
+        )
+
+        results = []
+        for i, audio_file in enumerate(files):
+            if progress_callback:
+                progress_callback(i + 1, len(files), audio_file.name)
+
+            lyrics, lang = self.transcribe(str(audio_file), language=language)
+
+            # Save sidecar file
+            output_path = audio_file.with_suffix(output_suffix)
+            if not lyrics.startswith("❌"):
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(lyrics)
+
+            results.append({
+                "filename": audio_file.name,
+                "lyrics": lyrics,
+                "language": lang,
+                "output_path": str(output_path),
+            })
+
+        return results
+
+
+class ElevenLabsTranscriber:
+    """Transcribe lyrics using ElevenLabs Scribe API.
+
+    Provides word-level timestamps similar to Whisper but uses ElevenLabs'
+    speech-to-text engine. Requires an ElevenLabs API key.
+
+    Usage:
+        transcriber = ElevenLabsTranscriber(api_key="el-...")
+        lyrics, language = transcriber.transcribe("song.mp3")
+    """
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.api_url = "https://api.elevenlabs.io/v1/speech-to-text"
+
+    def transcribe(
+        self,
+        audio_path: str,
+        language: Optional[str] = None,
+    ) -> tuple:
+        """Transcribe audio using ElevenLabs Scribe.
+
+        Args:
+            audio_path: Path to audio file
+            language: Optional language code
+
+        Returns:
+            Tuple of (formatted_lyrics, detected_language)
+        """
+        import requests
+
+        try:
+            headers = {
+                "xi-api-key": self.api_key,
+            }
+            files = {
+                "file": (os.path.basename(audio_path), open(audio_path, "rb")),
+                "model_id": (None, "scribe_v1"),
+                "timestamps_granularity": (None, "word"),
+            }
+            if language:
+                files["language_code"] = (None, language)
+
+            response = requests.post(
+                self.api_url,
+                headers=headers,
+                files=files,
+                timeout=300,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            detected_lang = data.get("language_code", "unknown")
+            words = data.get("words", [])
+
+            # Filter for word-type entries only (not punctuation)
+            word_entries = [
+                w for w in words
+                if w.get("type", "word") == "word" and w.get("text", "").strip()
+            ]
+
+            if not word_entries:
+                text = data.get("text", "")
+                if text:
+                    return f"[Verse]\n{text}", detected_lang
+                return "[Instrumental]", detected_lang
+
+            # Format into lyrics lines (reuse Whisper's formatter)
+            formatted_words = [
+                {"word": w["text"], "start": w.get("start", 0), "end": w.get("end", 0)}
+                for w in word_entries
+            ]
+            lines = WhisperTranscriber._format_words_to_lines(formatted_words, detected_lang)
+            lyrics = "[Verse]\n" + "\n".join(lines)
+
+            return lyrics, detected_lang
+
+        except Exception as e:
+            return f"❌ ElevenLabs API error: {str(e)}", "unknown"
+
+    def transcribe_directory(
+        self,
+        input_dir: str,
+        output_suffix: str = ".lyrics.txt",
+        language: Optional[str] = None,
+        progress_callback=None,
+    ) -> List[Dict]:
+        """Batch transcribe directory (same interface as WhisperTranscriber)."""
+        audio_extensions = {'.mp3', '.wav', '.flac', '.ogg', '.opus'}
+        files = sorted(
+            f for f in Path(input_dir).iterdir()
+            if f.suffix.lower() in audio_extensions
+        )
+
+        results = []
+        for i, audio_file in enumerate(files):
+            if progress_callback:
+                progress_callback(i + 1, len(files), audio_file.name)
+
+            lyrics, lang = self.transcribe(str(audio_file), language=language)
+
+            output_path = audio_file.with_suffix(output_suffix)
+            if not lyrics.startswith("❌"):
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(lyrics)
+
+            results.append({
+                "filename": audio_file.name,
+                "lyrics": lyrics,
+                "language": lang,
+                "output_path": str(output_path),
+            })
+
+        return results
+
+
+class GeminiCaptioner:
+    """Generate audio captions and lyrics using Google's Gemini API.
+
+    Uses Gemini's multimodal audio understanding to produce both
+    detailed music captions and lyrics transcriptions. Supports large
+    files via Google's file upload API (for files >20MB).
+
+    Usage:
+        captioner = GeminiCaptioner(api_key="AIza...")
+        result = captioner.analyze("song.mp3")
+        # result = {"caption": "...", "lyrics": "...", "genre": "...", ...}
+    """
+
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+        self.api_key = api_key
+        self.model = model
+
+    def analyze(
+        self,
+        audio_path: str,
+        include_lyrics: bool = True,
+    ) -> Dict[str, str]:
+        """Analyze audio to extract caption, lyrics, and metadata.
+
+        Args:
+            audio_path: Path to audio file
+            include_lyrics: If True, also transcribe lyrics
+
+        Returns:
+            Dict with: caption, lyrics, genre, bpm, keyscale, language
+        """
+        try:
+            import google.generativeai as genai
+        except ImportError:
+            return {"error": "google-generativeai not installed. Run: pip install google-generativeai"}
+
+        genai.configure(api_key=self.api_key)
+
+        try:
+            model = genai.GenerativeModel(self.model)
+
+            # Check file size for upload strategy
+            file_size = os.path.getsize(audio_path)
+
+            if file_size > 20 * 1024 * 1024:
+                # Large file: use upload API
+                uploaded = genai.upload_file(audio_path)
+                audio_part = uploaded
+            else:
+                # Small file: inline
+                with open(audio_path, "rb") as f:
+                    audio_data = f.read()
+
+                import mimetypes
+                mime_type = mimetypes.guess_type(audio_path)[0] or "audio/mpeg"
+                audio_part = {
+                    "mime_type": mime_type,
+                    "data": audio_data,
+                }
+
+            # Build prompt
+            lyrics_instruction = ""
+            if include_lyrics:
+                lyrics_instruction = (
+                    '  "lyrics": "<transcribed lyrics with section tags like [Verse], [Chorus], or [Instrumental] if none>",\n'
+                    '  "language": "<detected vocal language code, e.g. en, ja, it>",\n'
+                )
+
+            prompt = (
+                "Analyze this audio file and provide a JSON response with the following fields:\n"
+                "{\n"
+                '  "caption": "<detailed description of the music: style, instruments, mood, structure>",\n'
+                '  "genre": "<primary genre tags separated by commas>",\n'
+                '  "bpm": <estimated BPM as integer>,\n'
+                '  "keyscale": "<musical key, e.g. C Major, Am>",\n'
+                '  "timesignature": "<time signature numerator, e.g. 4 for 4/4>",\n'
+                + lyrics_instruction +
+                "}\n\n"
+                "IMPORTANT: Return ONLY valid JSON, no markdown, no extra text."
+            )
+
+            response = model.generate_content([audio_part, prompt])
+            raw_text = response.text.strip()
+
+            # Parse JSON response
+            result = self._parse_gemini_response(raw_text, include_lyrics)
+
+            # Clean up uploaded file if needed
+            if file_size > 20 * 1024 * 1024:
+                try:
+                    genai.delete_file(uploaded.name)
+                except Exception:
+                    pass
+
+            return result
+
+        except Exception as e:
+            return {"error": f"Gemini API error: {str(e)}"}
+
+    @staticmethod
+    def _parse_gemini_response(raw_text: str, include_lyrics: bool = True) -> Dict[str, str]:
+        """Parse Gemini's JSON response, handling markdown code fences.
+
+        Args:
+            raw_text: Raw response text from Gemini
+            include_lyrics: Whether lyrics field is expected
+
+        Returns:
+            Parsed result dict
+        """
+        import re
+
+        # Strip markdown code fences if present
+        text = raw_text.strip()
+        if text.startswith("```"):
+            text = re.sub(r'^```(?:json)?\s*\n?', '', text)
+            text = re.sub(r'\n?```\s*$', '', text)
+
+        result = {
+            "caption": "",
+            "genre": "",
+            "bpm": None,
+            "keyscale": "",
+            "timesignature": "",
+            "lyrics": "[Instrumental]",
+            "language": "unknown",
+        }
+
+        try:
+            data = json.loads(text)
+            result["caption"] = data.get("caption", "")
+            result["genre"] = data.get("genre", "")
+            result["keyscale"] = data.get("keyscale", "")
+            result["timesignature"] = str(data.get("timesignature", ""))
+
+            bpm_val = data.get("bpm")
+            if bpm_val is not None:
+                try:
+                    result["bpm"] = int(float(bpm_val))
+                except (ValueError, TypeError):
+                    pass
+
+            if include_lyrics:
+                result["lyrics"] = data.get("lyrics", "[Instrumental]")
+                result["language"] = data.get("language", "unknown")
+
+        except json.JSONDecodeError:
+            # Fallback: try to extract caption from raw text
+            result["caption"] = text[:500]
+
+        return result
+
+    def analyze_directory(
+        self,
+        input_dir: str,
+        output_dir: Optional[str] = None,
+        include_lyrics: bool = True,
+        progress_callback=None,
+    ) -> List[Dict]:
+        """Batch analyze all audio files in a directory.
+
+        Args:
+            input_dir: Directory containing audio files
+            output_dir: Optional directory for JSON output files
+            include_lyrics: Whether to include lyrics transcription
+            progress_callback: Optional callback(current, total, filename)
+
+        Returns:
+            List of result dicts
+        """
+        audio_extensions = {'.mp3', '.wav', '.flac', '.ogg', '.opus'}
+        files = sorted(
+            f for f in Path(input_dir).iterdir()
+            if f.suffix.lower() in audio_extensions
+        )
+
+        results = []
+        for i, audio_file in enumerate(files):
+            if progress_callback:
+                progress_callback(i + 1, len(files), audio_file.name)
+
+            result = self.analyze(str(audio_file), include_lyrics=include_lyrics)
+            result["filename"] = audio_file.name
+            result["path"] = str(audio_file)
+            results.append(result)
+
+            # Save individual JSON if output_dir specified
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                json_path = Path(output_dir) / f"{audio_file.stem}.json"
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(result, f, indent=2, ensure_ascii=False)
+
+            # Save sidecar files
+            if result.get("caption") and not result["caption"].startswith("❌"):
+                caption_path = audio_file.with_suffix(".caption.txt")
+                with open(caption_path, 'w', encoding='utf-8') as f:
+                    f.write(result["caption"])
+
+            if include_lyrics and result.get("lyrics") and result["lyrics"] != "[Instrumental]":
+                lyrics_path = audio_file.with_suffix(".lyrics.txt")
+                with open(lyrics_path, 'w', encoding='utf-8') as f:
+                    f.write(result["lyrics"])
+
+        return results
+
+
 # ============== Gradio UI ==============
 
 def open_folder_picker() -> str:

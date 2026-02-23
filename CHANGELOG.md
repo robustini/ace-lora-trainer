@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-02-23 — Upstream Sync: ACE-Step 1.5 Improvements
+
+### Critical Bug Fixes (from upstream PRs)
+- **torch.compile + PEFT crash guard (PR #640):** Auto-detects PEFT LoRA adapters and skips `torch.compile` to prevent crashes on PyTorch ≥2.7 + CUDA. Previously, enabling torch.compile with LoRA active would cause hard crashes
+- **Symlink resolution in dataset paths (PR #648):** Uses `os.path.realpath()` instead of `os.path.normpath()` when resolving tensor file paths. Prevents false rejections when datasets are stored on symlinked/junction paths
+
+### Two-Pass Preprocessing (Low VRAM)
+- **New method:** `DatasetBuilder.preprocess_two_pass()` splits preprocessing into two sequential passes for GPUs with 8-12GB VRAM
+  - **Pass 1 (~3GB):** VAE + Text Encoder — encodes audio to latents, tokenizes text/lyrics, saves intermediate `.tmp.pt` files
+  - **Pass 2 (~6GB):** DIT Encoder — loads intermediates, runs model.encoder, saves final `.pt` files
+  - Automatically offloads VAE + Text Encoder to CPU between passes
+  - Temporary files cleaned up after completion
+- **Why:** The single-pass pipeline requires all models simultaneously (~10-12GB). Two-pass mode enables preprocessing on 8GB GPUs
+
+### GPU Monitoring
+- **New module:** `acestep/training/gpu_monitor.py` with `GPUMonitor` class
+  - Background threaded monitoring with configurable poll interval
+  - VRAM alert threshold (default 92%) with callback support
+  - Snapshot history with summary statistics (peak, average, utilization)
+  - Auto-starts during Fabric training, logs summary at completion
+- **New helpers:** `detect_gpu()` returns GPU name/driver/compute cap, `get_available_vram_mb()` returns free VRAM
+
+### Cosine Restarts Scheduler
+- **New scheduler option:** `scheduler_type = "cosine_restarts"` — cosine annealing with warm restarts
+  - Periodically resets learning rate, which can help escape local minima on small LoRA datasets
+  - First cycle = 1/4 of remaining steps, subsequent cycles double (T_mult=2)
+  - Minimum LR = 1% of initial LR (same as cosine)
+
+### VRAM Presets (Externalized JSON)
+- **New directory:** `acestep/training/presets/` with 7 JSON preset files:
+  - `vram_8gb.json` — rank 16, 8-bit optimizer, encoder offloading
+  - `vram_12gb.json` — rank 32, 8-bit optimizer, encoder offloading
+  - `vram_16gb.json` — rank 64, standard optimizer
+  - `vram_24gb_plus.json` — rank 128, batch size 2
+  - `recommended.json` — balanced defaults matching upstream
+  - `quick_test.json` — rank 16, 10 epochs, fast iteration
+  - `high_quality.json` — rank 128, 1000 epochs, min-SNR weighting
+- **New APIs:** `list_presets()`, `load_preset(name)`, `apply_preset(config, lora_config, name)`, `auto_select_preset()` (auto-detects GPU and picks best preset)
+
+### MLX Backend (Apple Silicon)
+- **New module:** `acestep/mlx/` with infrastructure for Apple Silicon acceleration (2-3x faster than MPS)
+  - `__init__.py` — `is_mlx_available()` detection (macOS + arm64 + mlx import)
+  - `convert.py` — weight conversion from PyTorch to MLX format (Conv1d axis swaps, weight_norm fusion, rotary embedding skipping)
+  - `engine.py` — `MLXInferenceEngine` class with model loading, weight caching, and generation API surface
+  - Weight conversion and caching is fully implemented; full DiT/VAE model porting is in progress
+
+### Data Preparation Scripts (Captioner)
+- **WhisperTranscriber** — Transcribe lyrics via OpenAI Whisper API with word-level timestamps and intelligent line breaking for CJK/Latin scripts. Batch directory processing with sidecar `.lyrics.txt` output
+- **ElevenLabsTranscriber** — Transcribe lyrics via ElevenLabs Scribe API. Same word-level timestamp approach as Whisper, filters for word-type entries only
+- **GeminiCaptioner** — Full audio analysis via Google Gemini API. Generates caption, lyrics, genre, BPM, key, time signature in structured JSON. Supports large files (>20MB) via file upload API. Batch processing with sidecar `.caption.txt` and `.lyrics.txt` files
+
 ## 2026-02-22b — Min-SNR Loss Weighting, NaN Detection, Audio Normalization
 
 ### Min-SNR Loss Weighting (from Side-Step / Hang et al. 2023)

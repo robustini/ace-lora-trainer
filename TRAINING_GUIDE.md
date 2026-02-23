@@ -30,8 +30,11 @@ A complete guide to training LoRA and LoKr adapters on ACE-Step 1.5 music genera
    - [Turbo vs Base Model Training](#turbo-vs-base-model-training)
 8. [GPU Presets Reference](#gpu-presets-reference)
 9. [Epoch & Dataset Guidelines](#epoch--dataset-guidelines)
-10. [Labeling Your Audio: Three Approaches](#labeling-your-audio-three-approaches)
+10. [Labeling Your Audio: Five Approaches](#labeling-your-audio-three-approaches)
 11. [Advanced Features](#advanced-features)
+    - [GPU Monitoring](#gpu-monitoring)
+    - [MLX Backend (Apple Silicon)](#mlx-backend-apple-silicon)
+    - [External Data Preparation Backends](#external-data-preparation-backends)
     - [Gradient Sensitivity Estimation](#gradient-sensitivity-estimation)
     - [Resume from Checkpoint](#resume-from-checkpoint)
     - [LoRA Merge into Base Model](#lora-merge-into-base-model)
@@ -205,12 +208,14 @@ python launch.py --share          # Create public Gradio link
 
 **Goal:** Generate text descriptions and metadata for each audio file. The model needs text labels to learn what it's hearing.
 
-You have **three labeling approaches** (see [Labeling Your Audio](#labeling-your-audio-three-approaches) for details):
+You have **five labeling approaches** (see [Labeling Your Audio](#labeling-your-audio-three-approaches) for details):
 
 | Approach | Quality | Effort | VRAM Needed |
 |----------|---------|--------|-------------|
 | **Standalone Captioner** (recommended) | Best | Low | ~22GB per model |
 | **Built-in AI Label** (convenient) | Good | Lowest | ~3.5GB extra |
+| **Gemini API** (cloud, caption + lyrics) | Very Good | Low | None (cloud API) |
+| **Whisper / ElevenLabs API** (lyrics only) | Good | Low | None (cloud API) |
 | **Manual / CSV** | Depends on you | Highest | None |
 
 **Recommended approach — Standalone Captioner:**
@@ -275,11 +280,14 @@ The trainer auto-detects **turbo** vs **base** model and configures parameters a
 
 1. In **"3. Preprocess"**, verify the tensor output directory
 2. Set **Max Duration** (default 240s) — longer songs get truncated
-3. Click **"Preprocess Tensors"**
+3. Choose preprocessing mode:
+   - **Standard** — loads all models simultaneously (~10-12GB VRAM), fastest
+   - **Two-Pass (Low VRAM)** — splits into two sequential passes (~3GB then ~6GB), works on 8GB GPUs
+4. Click **"Preprocess Tensors"**
 
 This encodes each audio through the VAE and tokenizes captions with the text encoder, producing `.pt` tensor files (~5MB each). The VAE and text encoder load automatically if not already loaded.
 
-> **Note:** Preprocessing is a one-time step. You can reuse the same tensors across multiple training runs with different hyperparameters.
+> **Note:** Preprocessing is a one-time step. You can reuse the same tensors across multiple training runs with different hyperparameters. Both standard and two-pass produce identical `.pt` files.
 
 ### Step 5: Configure Training
 
@@ -377,9 +385,12 @@ All schedulers include a warmup phase — LR ramps up linearly from 10% to 100% 
 | Scheduler | After Warmup | Best Paired With |
 |-----------|-------------|------------------|
 | **Cosine** | LR follows a cosine curve down to 1% | AdamW, AdamW 8-bit |
+| **Cosine Restarts** | Cosine with periodic warm restarts (LR resets) | AdamW — useful for escaping local minima on small datasets |
 | **Linear** | LR decreases linearly to 1% | AdamW, AdamW 8-bit |
 | **Constant** | LR stays at 100% | Prodigy (forced) |
 | **Constant + Warmup** | LR ramps up then stays at 100% | Adafactor, Prodigy |
+
+**Cosine Restarts:** The LR periodically resets to its initial value then decays again. The first cycle covers 1/4 of training steps; each subsequent cycle is 2x longer. This can help the model escape local minima, especially useful when training on small LoRA datasets (1-5 songs).
 
 ### Attention Targeting
 
@@ -395,11 +406,21 @@ All schedulers include a warmup phase — LR ramps up linearly from 10% to 100% 
 |---------|-----------|------------|--------------|
 | **Gradient Checkpointing** | ~40-60% | ~30% slower | Recomputes activations during backward pass instead of storing them. |
 | **Encoder Offloading** | ~2-4 GB | Minimal | Moves text encoder, VAE, tokenizer to CPU during training. |
+| **Two-Pass Preprocessing** | ~6-8 GB | ~2x slower preprocess | Splits tensor preprocessing into two sequential passes (see below). |
 | **Self-attn Only** | ~40% adapter | None | Simply trains fewer parameters. |
 | **Lower Rank** | Proportional | None | Rank 16 uses ~4x less memory than rank 64. |
 
+**Two-Pass Preprocessing (for 8-12GB GPUs):**
+
+The standard preprocessing pipeline loads VAE + Text Encoder + DIT Encoder simultaneously (~10-12GB). Two-pass mode splits this into:
+
+- **Pass 1 (~3 GB):** VAE encode audio + Text Encoder tokenize — saves intermediate `.tmp.pt` files, then offloads both to CPU
+- **Pass 2 (~6 GB):** DIT Encoder produces `encoder_hidden_states` from intermediates — saves final `.pt` files
+
+This enables preprocessing on 8GB GPUs that would otherwise OOM. The resulting `.pt` files are identical to single-pass output. Use `DatasetBuilder.preprocess_two_pass()` programmatically or select "Two-Pass (Low VRAM)" in the UI.
+
 **Recommended stacking for low VRAM:**
-- **8GB:** Grad Checkpointing + Encoder Offloading + Self-attn only + Rank 16 + Adafactor + Batch 1
+- **8GB:** Two-Pass Preprocess + Grad Checkpointing + Encoder Offloading + Self-attn only + Rank 16 + Adafactor + Batch 1
 - **10-12GB:** Grad Checkpointing + Encoder Offloading + Both attn + Rank 32 + AdamW 8-bit + Batch 1
 - **16-24GB:** No VRAM saving needed. Prodigy + Rank 64 + Batch 2-3.
 
@@ -453,6 +474,34 @@ Both model types use logit-normal timestep sampling and CFG dropout. Parameters 
 ## GPU Presets Reference
 
 Presets are **adapter-aware** — they apply different optimal settings when LoRA or LoKr is selected.
+
+### JSON Presets (New)
+
+Training presets are also available as external JSON files in `acestep/training/presets/`. These can be loaded programmatically or customized:
+
+| Preset File | Description |
+|-------------|-------------|
+| `recommended.json` | Balanced defaults matching upstream ACE-Step |
+| `vram_8gb.json` | Aggressive savings — rank 16, 8-bit optimizer, encoder offloading |
+| `vram_12gb.json` | Standard — rank 32, 8-bit optimizer, encoder offloading |
+| `vram_16gb.json` | Comfortable — rank 64, standard optimizer |
+| `vram_24gb_plus.json` | High-capacity — rank 128, batch size 2 |
+| `quick_test.json` | Fast iteration — rank 16, 10 epochs |
+| `high_quality.json` | Long runs — rank 128, 1000 epochs, Min-SNR weighting |
+
+**Programmatic usage:**
+```python
+from acestep.training.configs import load_preset, apply_preset, auto_select_preset
+
+# Auto-detect GPU and pick the best preset
+preset_name = auto_select_preset()  # e.g., "vram_16gb"
+
+# Or load a specific preset
+apply_preset(training_config, lora_config, "recommended")
+
+# Or create your own JSON preset and load by path
+apply_preset(training_config, lora_config, "/path/to/my_custom.json")
+```
 
 ### RTX 4090 / 5090 (24GB+)
 
@@ -550,9 +599,129 @@ Write your own captions and metadata, either directly in the sample editor or by
 
 **CSV format:** Place a CSV in your audio directory with columns: `filename`, `caption`, `genre`, `bpm`, `keyscale`, `timesignature`, `lyrics`, `language`
 
+### Approach 4: Gemini API (cloud-based, full analysis)
+
+Uses Google's Gemini multimodal model to analyze audio and produce caption, lyrics, genre, BPM, key, and time signature in a single API call. No local GPU needed.
+
+**Pros:** Very good quality, full metadata extraction, no local VRAM
+**Cons:** Requires Google API key, usage costs, internet connection
+
+```python
+from captioner_standalone import GeminiCaptioner
+captioner = GeminiCaptioner(api_key="AIza...")
+captioner.analyze_directory("./audio/", output_dir="./captions/")
+```
+
+### Approach 5: Whisper / ElevenLabs API (cloud-based, lyrics only)
+
+Uses OpenAI Whisper or ElevenLabs Scribe for lyrics transcription with word-level timestamps. Produces `.lyrics.txt` sidecar files. Best paired with another approach for captions.
+
+**Pros:** Accurate lyrics, word-level timestamps, CJK support, no local VRAM
+**Cons:** Lyrics only (no captions/metadata), requires API key
+
+```python
+from captioner_standalone import WhisperTranscriber
+transcriber = WhisperTranscriber(api_key="sk-...")
+transcriber.transcribe_directory("./audio/")
+```
+
 ---
 
 ## Advanced Features
+
+### GPU Monitoring
+
+The trainer includes real-time GPU memory monitoring during training runs:
+
+- **Background monitoring:** A `GPUMonitor` thread samples VRAM usage every 10 seconds during Fabric training
+- **Alert threshold:** Logs a warning when VRAM utilization exceeds 92% (configurable)
+- **Training summary:** At the end of training, a summary is printed: peak allocated, average usage, number of samples
+
+**Programmatic usage:**
+```python
+from acestep.training.gpu_monitor import GPUMonitor, detect_gpu, get_available_vram_mb
+
+# Quick GPU info
+gpu_info = detect_gpu()  # {"name": "NVIDIA RTX 4090", "backend": "cuda", ...}
+free_mb = get_available_vram_mb()
+
+# Manual monitoring
+monitor = GPUMonitor(alert_threshold_pct=90.0, poll_interval_sec=5.0)
+monitor.start()
+# ... do work ...
+monitor.stop()
+print(monitor.format_summary())
+```
+
+### MLX Backend (Apple Silicon)
+
+For Mac users with Apple Silicon (M1/M2/M3/M4), an MLX backend provides 2-3x faster inference compared to MPS.
+
+**Status:** Weight conversion infrastructure is fully implemented. The full DiT/VAE model porting is in progress — for now, use the PyTorch backend.
+
+**Setup:**
+```bash
+# macOS only — Apple Silicon required
+pip install mlx mlx-nn
+```
+
+**Usage:**
+```python
+from acestep.mlx import is_mlx_available, get_mlx_engine
+
+if is_mlx_available():
+    MLXEngine = get_mlx_engine()
+    engine = MLXEngine()
+    engine.load_model("path/to/acestep-v15-turbo")  # Converts + caches weights
+```
+
+### External Data Preparation Backends
+
+In addition to the built-in captioner (Qwen2.5-Omni) and AI labeler (5Hz LM), three external API backends are available for lyrics transcription and audio captioning:
+
+#### Whisper API (OpenAI)
+Transcribes lyrics with word-level timestamps. Intelligent line breaking for both CJK and Latin scripts.
+```bash
+pip install openai
+```
+```python
+from captioner_standalone import WhisperTranscriber
+
+transcriber = WhisperTranscriber(api_key="sk-...")
+lyrics, language = transcriber.transcribe("song.mp3")
+# Or batch process an entire directory:
+results = transcriber.transcribe_directory("./audio/", language="en")
+```
+
+#### ElevenLabs Scribe
+Alternative transcription engine using ElevenLabs' speech-to-text API.
+```bash
+pip install elevenlabs
+```
+```python
+from captioner_standalone import ElevenLabsTranscriber
+
+transcriber = ElevenLabsTranscriber(api_key="el-...")
+lyrics, language = transcriber.transcribe("song.mp3")
+```
+
+#### Gemini Audio Analysis (Google)
+Full multimodal audio analysis — generates caption, lyrics, genre, BPM, key, and time signature in one call. Supports large files (>20MB) via file upload API.
+```bash
+pip install google-generativeai
+```
+```python
+from captioner_standalone import GeminiCaptioner
+
+captioner = GeminiCaptioner(api_key="AIza...")
+result = captioner.analyze("song.mp3")
+# result = {"caption": "...", "lyrics": "...", "genre": "rock", "bpm": 120, ...}
+
+# Batch directory with sidecar files:
+results = captioner.analyze_directory("./audio/", output_dir="./captions/")
+```
+
+All three backends produce output compatible with the trainer's dataset pipeline: `.lyrics.txt` sidecar files, `.caption.txt` sidecar files, and structured JSON metadata.
 
 ### Gradient Sensitivity Estimation
 
@@ -663,6 +832,12 @@ When captioning large batches (50+ files):
 - Each checkpoint directory must contain a `config.json` file
 - Directory name must start with `acestep-v15-`
 
+**torch.compile crash with LoRA active**
+- This is a known issue with PyTorch 2.7+ and PEFT LoRA adapters (upstream PR #640). The trainer auto-detects this and disables `torch.compile` when LoRA is active. If you see a crash, ensure your trainer is up to date.
+
+**Dataset paths rejected on symlinked/junction drives**
+- Fixed in the latest version (upstream PR #648). The trainer now uses `os.path.realpath()` to resolve symlinks before validating paths.
+
 **Loss is NaN or explodes**
 - Reduce learning rate (try 5e-5 or 1e-5)
 - Re-preprocess tensors
@@ -693,6 +868,9 @@ Training logs are saved to `lora_output/<project>/logs/`. Check these if trainin
 | Model auto-download | Outbound HTTPS | `huggingface.co`, `modelscope.cn` |
 | Gradio UI | Local only | `127.0.0.1:7861` (never exposed unless `--share`) |
 | Training loop | None | Fully offline after download |
+| Whisper API (optional) | Outbound HTTPS | `api.openai.com` |
+| ElevenLabs API (optional) | Outbound HTTPS | `api.elevenlabs.io` |
+| Gemini API (optional) | Outbound HTTPS | `generativelanguage.googleapis.com` |
 
 ### `--share` Warning
 

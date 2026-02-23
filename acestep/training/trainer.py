@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
     LinearLR,
     ConstantLR,
     SequentialLR,
@@ -43,6 +44,7 @@ from acestep.training.lora_utils import (
     upcast_model_for_training,
 )
 from acestep.training.data_module import PreprocessedDataModule
+from acestep.training.gpu_monitor import GPUMonitor
 
 # Optional: LyCORIS for LoKr support
 try:
@@ -119,6 +121,7 @@ def create_scheduler(optimizer, training_config, total_steps: int):
 
     Supports:
     - cosine: Cosine annealing to 1% of initial LR (default)
+    - cosine_restarts: Cosine annealing with warm restarts (periodic LR resets)
     - linear: Linear decay to 1% of initial LR
     - constant: Constant LR (no decay after warmup)
     - constant_with_warmup: Same as constant (warmup is always included)
@@ -154,6 +157,18 @@ def create_scheduler(optimizer, training_config, total_steps: int):
             optimizer,
             factor=1.0,
             total_iters=main_steps,
+        )
+    elif sched_type == "cosine_restarts":
+        # Cosine annealing with warm restarts.
+        # Periodic LR resets can help escape local minima on small LoRA datasets.
+        # T_0 = period of the first restart cycle (1/4 of remaining steps).
+        # T_mult = each subsequent cycle is 2× longer.
+        restart_period = max(1, main_steps // 4)
+        main_scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=restart_period,
+            T_mult=2,
+            eta_min=lr * 0.01,
         )
     else:
         # Default: cosine
@@ -788,7 +803,14 @@ class LoRATrainer:
             loggers=fabric_loggers,
         )
         self.fabric.launch()
-        
+
+        # Start GPU monitoring (background thread logs VRAM usage)
+        self._gpu_monitor = GPUMonitor(alert_threshold_pct=92.0, poll_interval_sec=10.0)
+        if torch.cuda.is_available():
+            self._gpu_monitor.start()
+            snap = self._gpu_monitor.get_current()
+            yield 0, 0.0, f"📊 GPU: {snap['allocated_mb']:.0f}MB / {snap['total_mb']:.0f}MB allocated"
+
         model_info = f"{'turbo' if self.training_config.is_turbo else 'base'}"
         model_info += f", timestep: logit-normal(μ={self.training_config.timestep_mu}, σ={self.training_config.timestep_sigma})"
         if self.training_config.use_cfg:
@@ -868,7 +890,22 @@ class LoRATrainer:
         # Compile decoder for faster training (after Fabric setup)
         # Off by default: JIT warm-up is very slow on Windows, and variable-length
         # tensors cause repeated recompilation that makes training *slower*.
-        if self.training_config.torch_compile:
+        #
+        # CRITICAL (PR #640): torch.compile crashes with PEFT LoRA adapters on
+        # PyTorch 2.7.x+ / CUDA. Detect and skip automatically.
+        peft_active = False
+        try:
+            from peft import PeftModel
+            _raw_dec = self.module.model.decoder
+            if hasattr(_raw_dec, '_forward_module'):
+                _raw_dec = _raw_dec._forward_module
+            peft_active = isinstance(_raw_dec, PeftModel)
+        except ImportError:
+            pass
+
+        if self.training_config.torch_compile and peft_active:
+            yield 0, 0.0, "⚠️ torch.compile disabled: incompatible with PEFT LoRA adapters on PyTorch ≥2.7 (PR #640 fix)"
+        elif self.training_config.torch_compile:
             try:
                 import sys
                 compile_mode = "default" if sys.platform == "win32" else "reduce-overhead"
@@ -1182,6 +1219,13 @@ class LoRATrainer:
         else:
             self._save_adapter_weights(final_path)
             yield global_step, final_loss, f"✅ Training complete! {adapter_label} saved to {final_path} (last epoch weights)"
+
+        # Stop GPU monitor and report summary
+        if hasattr(self, '_gpu_monitor') and self._gpu_monitor:
+            self._gpu_monitor.stop()
+            summary = self._gpu_monitor.format_summary()
+            if summary != "No GPU data collected":
+                yield global_step, final_loss, f"📊 {summary}"
 
     def _train_basic(
         self,

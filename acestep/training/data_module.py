@@ -80,12 +80,14 @@ class PreprocessedTensorDataset(Dataset):
                     continue
                 if not os.path.isabs(p):
                     p = os.path.join(tensor_dir, p)
-                resolved = os.path.normpath(p)
+                # PR #648: Use realpath to resolve symlinks/junctions before
+                # validation, preventing false rejections on symlinked datasets.
+                resolved = os.path.realpath(os.path.normpath(p))
                 # Fallback: if absolute path doesn't exist, try by filename in tensor_dir
                 # This handles cases where tensors were preprocessed at a different location
                 if not os.path.exists(resolved):
                     basename = os.path.basename(resolved)
-                    local_path = os.path.normpath(os.path.join(tensor_dir, basename))
+                    local_path = os.path.realpath(os.path.normpath(os.path.join(tensor_dir, basename)))
                     if os.path.exists(local_path):
                         resolved = local_path
                 self.sample_paths.append(resolved)
@@ -96,7 +98,7 @@ class PreprocessedTensorDataset(Dataset):
                     p = detail["path"]
                     if not os.path.isabs(p):
                         p = os.path.join(tensor_dir, p)
-                    self._checksum_map[os.path.normpath(p)] = detail["md5"]
+                    self._checksum_map[os.path.realpath(os.path.normpath(p))] = detail["md5"]
 
             manifest_ver = self.manifest.get("version", 1)
             num_samples = self.manifest.get("num_samples", len(self.sample_paths))

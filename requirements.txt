@@ -34,6 +34,8 @@ torchao; sys_platform != 'win32' and sys_platform != 'darwin'
 peft>=0.7.0
 lightning>=2.0.0
 prodigyopt>=1.1.0
+tensorboard>=2.14.0  # TensorBoard logging (used by Lightning Fabric during training)
+safetensors>=0.4.0   # Safe tensor serialization (adapters, model weights)
 
 # --- Audio Processing ---
 soundfile>=0.13.1
@@ -65,3 +67,14 @@ lycoris-lora>=2.0.0
 # --- Optional: 8-bit optimizer (saves ~30-40% VRAM) ---
 # Uncomment if you want AdamW 8-bit support:
 # bitsandbytes>=0.43.0; sys_platform != 'darwin'
+
+# --- Optional: MLX backend for Apple Silicon (2-3x faster than MPS) ---
+# Only works on macOS with Apple Silicon (M1/M2/M3/M4)
+# mlx>=0.22.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+# mlx-nn>=0.22.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+
+# --- Optional: External captioner/transcription API backends ---
+# Uncomment the ones you need:
+# openai>=1.0.0           # Whisper API transcription
+# google-generativeai     # Gemini audio analysis (caption + lyrics + metadata)
+# elevenlabs              # ElevenLabs Scribe transcription

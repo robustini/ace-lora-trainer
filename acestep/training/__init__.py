@@ -29,6 +29,8 @@ from acestep.training.data_module import (
     load_dataset_from_json,
 )
 from acestep.training.trainer import LoRATrainer, PreprocessedLoRAModule, LIGHTNING_AVAILABLE
+from acestep.training.gpu_monitor import GPUMonitor, detect_gpu, get_available_vram_mb
+from acestep.training.configs import list_presets, load_preset, apply_preset, auto_select_preset
 
 # Optional: LoKr support via LyCORIS
 try:
@@ -80,4 +82,13 @@ __all__ = [
     "PreprocessedLoRAModule",
     "check_lightning_available",
     "LIGHTNING_AVAILABLE",
+    # GPU Monitor
+    "GPUMonitor",
+    "detect_gpu",
+    "get_available_vram_mb",
+    # Presets
+    "list_presets",
+    "load_preset",
+    "apply_preset",
+    "auto_select_preset",
 ]
