@@ -5,6 +5,7 @@ Provides utilities for injecting LoRA adapters into the DiT decoder model.
 Uses PEFT (Parameter-Efficient Fine-Tuning) library for LoRA implementation.
 """
 
+import json
 import os
 from typing import Optional, List, Dict, Any, Tuple
 from loguru import logger
@@ -305,23 +306,39 @@ def save_lora_weights(
     model,
     output_dir: str,
     save_full_model: bool = False,
+    trigger_word: str = "",
+    tag_position: str = "",
 ) -> str:
     """Save LoRA adapter weights.
-    
+
     Args:
         model: Model with LoRA adapters
         output_dir: Directory to save weights
         save_full_model: Whether to save the full model state dict
-        
+        trigger_word: Activation tag / trigger word for this LoRA style
+        tag_position: How the trigger word was used during training ("prepend", "append", "replace")
+
     Returns:
         Path to saved weights
     """
     os.makedirs(output_dir, exist_ok=True)
-    
+
     if hasattr(model, 'decoder') and hasattr(model.decoder, 'save_pretrained'):
         # Save PEFT adapter
         adapter_path = os.path.join(output_dir, "adapter")
         model.decoder.save_pretrained(adapter_path)
+        # Append trigger word to adapter_config.json
+        if trigger_word:
+            config_path = os.path.join(adapter_path, "adapter_config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config_data = json.load(f)
+                config_data["trigger_word"] = trigger_word
+                if tag_position:
+                    config_data["tag_position"] = tag_position
+                with open(config_path, "w") as f:
+                    json.dump(config_data, f, indent=2)
+                logger.info(f"Trigger word '{trigger_word}' saved to adapter config")
         logger.info(f"LoRA adapter saved to {adapter_path}")
         return adapter_path
     elif save_full_model:
@@ -409,6 +426,8 @@ def save_training_checkpoint(
     epoch: int,
     global_step: int,
     output_dir: str,
+    trigger_word: str = "",
+    tag_position: str = "",
 ) -> str:
     """Save a training checkpoint including LoRA weights and training state.
 
@@ -419,6 +438,8 @@ def save_training_checkpoint(
         epoch: Current epoch number
         global_step: Current global step
         output_dir: Directory to save checkpoint
+        trigger_word: Activation tag / trigger word for this LoRA style
+        tag_position: How the trigger word was used during training
 
     Returns:
         Path to saved checkpoint directory
@@ -426,7 +447,7 @@ def save_training_checkpoint(
     os.makedirs(output_dir, exist_ok=True)
 
     # Save LoRA adapter weights
-    adapter_path = save_lora_weights(model, output_dir)
+    adapter_path = save_lora_weights(model, output_dir, trigger_word=trigger_word, tag_position=tag_position)
 
     # Save training state (optimizer, scheduler, epoch, step)
     training_state = {

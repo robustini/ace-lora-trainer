@@ -785,6 +785,88 @@ class AceStepCaptioner:
 DEFAULT_MODEL_PATH = "ACE-Step/acestep-captioner"
 DEFAULT_TRANSCRIBER_PATH = "ACE-Step/acestep-transcriber"
 
+# ============== Config Save/Load ==============
+
+CAPTIONER_CONFIG_KEYS = [
+    "model_path_input",
+    "transcriber_path_input",
+    "split_input_dir",
+    "split_output_dir",
+    "split_duration",
+    "caption_input_dir",
+    "activation_tag_input",
+    "max_tokens_input",
+    "generate_lyrics_check",
+    "save_csv_check",
+    "csv_path_input",
+]
+
+DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "captioner_config.json")
+
+
+def save_captioner_config(config_path: str, *values) -> str:
+    """Save captioner UI settings to a JSON config file."""
+    if not config_path or not config_path.strip():
+        return "❌ Please specify a config file path"
+
+    ui_state = {}
+    for key, val in zip(CAPTIONER_CONFIG_KEYS, values):
+        # Convert gr component values to JSON-friendly types
+        if isinstance(val, (int, float)):
+            ui_state[key] = val
+        elif isinstance(val, bool):
+            ui_state[key] = val
+        else:
+            ui_state[key] = str(val) if val is not None else ""
+
+    payload = {
+        "schema": "captioner_config",
+        "version": 1,
+        "ui_state": ui_state,
+    }
+
+    out_path = config_path.strip()
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    return f"✅ Config saved: {out_path}"
+
+
+def load_captioner_config(config_path: str):
+    """Load captioner UI settings from a JSON config file.
+
+    Returns a tuple: (status_message, *component_updates) matching CAPTIONER_CONFIG_KEYS order.
+    """
+    import gradio as gr
+
+    in_path = (config_path or "").strip()
+    if not in_path:
+        return ("❌ Please specify a config file path", *[gr.update() for _ in CAPTIONER_CONFIG_KEYS])
+
+    if not os.path.isfile(in_path):
+        return (f"❌ Config not found: {in_path}", *[gr.update() for _ in CAPTIONER_CONFIG_KEYS])
+
+    try:
+        with open(in_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception as e:
+        return (f"❌ Failed to read config: {e}", *[gr.update() for _ in CAPTIONER_CONFIG_KEYS])
+
+    ui_state = payload.get("ui_state", {})
+
+    updates = []
+    for key in CAPTIONER_CONFIG_KEYS:
+        if key in ui_state:
+            updates.append(gr.update(value=ui_state[key]))
+        else:
+            updates.append(gr.update())
+
+    return (f"✅ Config loaded: {in_path}", *updates)
+
 
 # ============== Gradio UI ==============
 
@@ -1317,6 +1399,21 @@ def create_captioner_ui():
         </div>
         """)
 
+        # ==================== CONFIG ====================
+        with gr.Accordion("💾 Config (Save / Load Settings)", open=False):
+            with gr.Row(elem_classes="compact-row"):
+                config_path_input = gr.Textbox(
+                    label="Config File",
+                    value=DEFAULT_CONFIG_PATH,
+                    scale=4,
+                    info="Save or load all captioner settings",
+                )
+                config_path_picker = gr.Button("📁", scale=0, min_width=45)
+            with gr.Row():
+                save_config_btn = gr.Button("💾 Save Config", variant="secondary", scale=1)
+                load_config_btn = gr.Button("📂 Load Config", variant="secondary", scale=1)
+            config_status = gr.Textbox(label="Config Status", interactive=False, lines=1)
+
         # ==================== CAPTIONER MODEL ====================
         gr.HTML('<div class="section-title">🔧 Captioner Model (captions + metadata)</div>')
 
@@ -1462,6 +1559,32 @@ def create_captioner_ui():
         split_input_picker.click(fn=open_folder_picker, outputs=[split_input_dir])
         split_output_picker.click(fn=open_folder_picker, outputs=[split_output_dir])
         caption_input_picker.click(fn=open_folder_picker, outputs=[caption_input_dir])
+        config_path_picker.click(fn=open_folder_picker, outputs=[config_path_input])
+
+        # Config save/load — components must match CAPTIONER_CONFIG_KEYS order
+        _config_components = [
+            model_path_input,
+            transcriber_path_input,
+            split_input_dir,
+            split_output_dir,
+            split_duration,
+            caption_input_dir,
+            activation_tag_input,
+            max_tokens_input,
+            generate_lyrics_check,
+            save_csv_check,
+            csv_path_input,
+        ]
+        save_config_btn.click(
+            fn=save_captioner_config,
+            inputs=[config_path_input] + _config_components,
+            outputs=[config_status],
+        )
+        load_config_btn.click(
+            fn=load_captioner_config,
+            inputs=[config_path_input],
+            outputs=[config_status] + _config_components,
+        )
 
         # Captioner Model
         load_btn.click(fn=load_model_ui, inputs=[model_path_input], outputs=[model_status])
@@ -1504,6 +1627,13 @@ def create_captioner_ui():
             inputs=[sample_slider, edit_caption, edit_lyrics,
                     edit_bpm, edit_key, edit_timesig, edit_genre, edit_language],
             outputs=[edit_status],
+        )
+
+        # Auto-load config on startup if file exists
+        demo.load(
+            fn=load_captioner_config,
+            inputs=[config_path_input],
+            outputs=[config_status] + _config_components,
         )
 
     return demo

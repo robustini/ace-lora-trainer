@@ -598,11 +598,34 @@ class LoRATrainer:
                 yield 0, 0.0, "❌ No valid samples found in tensor directory"
                 return
             
+            # Extract trigger word from preprocessed data metadata
+            self.trigger_word = ""
+            self.tag_position = ""
+            try:
+                sample = data_module.train_dataset[0]
+                if isinstance(sample, dict) and "metadata" in sample:
+                    meta = sample["metadata"]
+                    if isinstance(meta, dict):
+                        self.trigger_word = meta.get("custom_tag", "")
+                        self.tag_position = meta.get("tag_position", "")
+                if not self.trigger_word:
+                    # Fallback: read first .pt file directly
+                    import glob as glob_mod
+                    pt_files = sorted(glob_mod.glob(os.path.join(tensor_dir, "*.pt")))
+                    if pt_files:
+                        first_data = torch.load(pt_files[0], map_location="cpu", weights_only=False)
+                        if isinstance(first_data, dict) and "metadata" in first_data:
+                            self.trigger_word = first_data["metadata"].get("custom_tag", "")
+                            self.tag_position = first_data["metadata"].get("tag_position", "")
+            except Exception as e:
+                logger.debug(f"Could not extract trigger word from data: {e}")
+
             crop_info = ""
             if self.training_config.max_latent_length > 0:
                 crop_secs = self.training_config.max_latent_length / 25  # 25 frames/sec
                 crop_info = f" (random crop to ~{crop_secs:.0f}s per sample)"
-            yield 0, 0.0, f"📂 Loaded {len(data_module.train_dataset)} preprocessed samples{crop_info}"
+            tag_info = f", trigger: '{self.trigger_word}'" if self.trigger_word else ""
+            yield 0, 0.0, f"📂 Loaded {len(data_module.train_dataset)} preprocessed samples{crop_info}{tag_info}"
 
             if LIGHTNING_AVAILABLE:
                 yield from self._train_with_fabric(data_module, training_state, resume_from)
@@ -617,26 +640,40 @@ class LoRATrainer:
     
     def _save_adapter_weights(self, output_dir: str):
         """Save adapter weights (LoRA or LoKr) to output_dir."""
+        trigger_word = getattr(self, "trigger_word", "")
+        tag_position = getattr(self, "tag_position", "")
         if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
             save_lokr_weights(
                 self.module.lycoris_net, output_dir,
                 lokr_config=self.lokr_config,
+                trigger_word=trigger_word,
+                tag_position=tag_position,
             )
         else:
-            save_lora_weights(self.module.model, output_dir)
+            save_lora_weights(
+                self.module.model, output_dir,
+                trigger_word=trigger_word,
+                tag_position=tag_position,
+            )
 
     def _save_adapter_checkpoint(self, optimizer, scheduler, epoch, global_step, output_dir):
         """Save training checkpoint (LoRA or LoKr) to output_dir."""
+        trigger_word = getattr(self, "trigger_word", "")
+        tag_position = getattr(self, "tag_position", "")
         if self.module.adapter_type == "lokr" and self.module.lycoris_net is not None:
             save_lokr_training_checkpoint(
                 self.module.lycoris_net, optimizer, scheduler,
                 epoch, global_step, output_dir,
                 lokr_config=self.lokr_config,
+                trigger_word=trigger_word,
+                tag_position=tag_position,
             )
         else:
             save_training_checkpoint(
                 self.module.model, optimizer, scheduler,
                 epoch, global_step, output_dir,
+                trigger_word=trigger_word,
+                tag_position=tag_position,
             )
 
     def _generate_samples(self, epoch: int) -> Generator[Tuple[int, float, str], None, None]:

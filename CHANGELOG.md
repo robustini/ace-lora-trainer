@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-02-25 — Trigger Word in LoRA Config, Captioner Config, Start Menu
+
+### LoRA/LoKR: Trigger Word Saved in Adapter JSON
+- The **activation tag** (trigger word) used during training is now automatically saved inside the adapter config JSON (`adapter_config.json` for LoRA, `lokr_config.json` for LoKR)
+- Fields added: `trigger_word` and `tag_position` (prepend/append/replace)
+- Extracted from preprocessed `.pt` file metadata at training start
+- Saved in all outputs: checkpoints, best model, and final model
+- The trigger word is also displayed in the training log at startup
+
+### Captioner: Config Save/Load System
+- New **Config (Save / Load Settings)** accordion in the Captioner UI
+- Saves and restores all UI fields: model paths, input/output folders, activation tag, max tokens, lyrics/CSV options
+- Config stored as `captioner_config.json` (default in project root)
+- **Auto-load on startup**: if config file exists, all fields are restored automatically
+
+### Start Menu: Interactive Launcher
+- `start.bat` now shows an interactive menu to choose between:
+  1. LoRA Trainer
+  2. Captioner
+  3. Both (Trainer + Captioner)
+- Command-line arguments still work (e.g. `start.bat --mode caption`) and skip the menu
+
+---
+
 ## 2026-02-24 — Captioner Performance Optimization + Detokenizer Fix
 
 ### Captioner: Single-Pass Caption + Metadata (~30-40% Faster)

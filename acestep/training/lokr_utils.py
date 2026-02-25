@@ -188,6 +188,8 @@ def save_lokr_weights(
     output_dir: str,
     lokr_config=None,
     dtype=None,
+    trigger_word: str = "",
+    tag_position: str = "",
 ) -> str:
     """Save LoKr adapter weights.
 
@@ -199,6 +201,8 @@ def save_lokr_weights(
         output_dir: Directory to save weights
         lokr_config: Optional LoKRConfig for saving metadata
         dtype: Optional dtype for saving (e.g. torch.bfloat16)
+        trigger_word: Activation tag / trigger word for this LoRA style
+        tag_position: How the trigger word was used during training
 
     Returns:
         Path to saved adapter directory
@@ -223,6 +227,10 @@ def save_lokr_weights(
     }
     if lokr_config is not None:
         config_data.update(lokr_config.to_dict())
+    if trigger_word:
+        config_data["trigger_word"] = trigger_word
+        if tag_position:
+            config_data["tag_position"] = tag_position
 
     config_path = os.path.join(adapter_path, "lokr_config.json")
     with open(config_path, "w") as f:
@@ -304,6 +312,8 @@ def save_lokr_training_checkpoint(
     global_step: int,
     output_dir: str,
     lokr_config=None,
+    trigger_word: str = "",
+    tag_position: str = "",
 ) -> str:
     """Save a training checkpoint including LoKr weights and training state.
 
@@ -315,6 +325,8 @@ def save_lokr_training_checkpoint(
         global_step: Current global step
         output_dir: Directory to save checkpoint
         lokr_config: Optional LoKRConfig for metadata
+        trigger_word: Activation tag / trigger word for this LoRA style
+        tag_position: How the trigger word was used during training
 
     Returns:
         Path to saved checkpoint directory
@@ -322,7 +334,7 @@ def save_lokr_training_checkpoint(
     os.makedirs(output_dir, exist_ok=True)
 
     # Save LoKr adapter weights
-    adapter_path = save_lokr_weights(lycoris_net, output_dir, lokr_config=lokr_config)
+    adapter_path = save_lokr_weights(lycoris_net, output_dir, lokr_config=lokr_config, trigger_word=trigger_word, tag_position=tag_position)
 
     # Save training state (optimizer, scheduler, epoch, step)
     training_state = {

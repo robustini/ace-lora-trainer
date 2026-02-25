@@ -13,6 +13,35 @@ if not exist "env\Scripts\activate.bat" (
     exit /b 1
 )
 
-REM Activate and launch
+REM Activate venv
 call env\Scripts\activate.bat
-python launch.py %*
+
+REM If command-line args were passed, skip the menu
+if not "%~1"=="" (
+    python launch.py %*
+    exit /b
+)
+
+REM Interactive menu
+:menu
+echo.
+echo ============================================================
+echo   ACE-Step LoRA Trainer
+echo ============================================================
+echo.
+echo   1) LoRA Trainer
+echo   2) Captioner
+echo   3) Both (Trainer + Captioner)
+echo.
+set /p choice="  Select [1-3]: "
+
+if "%choice%"=="1" (
+    python launch.py --mode train
+) else if "%choice%"=="2" (
+    python launch.py --mode caption
+) else if "%choice%"=="3" (
+    python launch.py --mode both
+) else (
+    echo   Invalid choice, please try again.
+    goto menu
+)
