@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-02-25b — Fix torch_dtype for Captioner & Transcriber
+
+### Fix: Models loading in float32 despite auto-dtype detection
+- **Bug:** Both `load_model()` (captioner) and `load_transcriber()` passed `dtype=` to `from_pretrained()`, but HuggingFace Transformers expects `torch_dtype=`. The parameter was silently ignored, causing models to load in **float32** even though the status log reported `bfloat16`/`float16`
+- **Impact:** ~2x unnecessary VRAM usage and slower inference for both captioner and transcriber
+- **Fix:** Changed `dtype=` to `torch_dtype=` in both model loaders
+
+---
+
 ## 2026-02-25 — Trigger Word in LoRA Config, Captioner Config, Start Menu
 
 ### LoRA/LoKR: Trigger Word Saved in Adapter JSON
