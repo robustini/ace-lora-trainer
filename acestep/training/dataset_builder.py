@@ -634,7 +634,7 @@ class DatasetBuilder:
         has_caption = bool(sample.caption)
         has_genre = bool(sample.genre)
         has_bpm = sample.bpm is not None
-        has_key = bool(sample.keyscale)
+        has_key = False  # Always regenerate keyscale (captioner doesn't reliably fill it)
         has_timesig = bool(sample.timesignature)
         has_language = bool(sample.language) and sample.language != "unknown"
         has_lyrics = bool(sample.lyrics) and sample.lyrics not in ("", "[Instrumental]")
