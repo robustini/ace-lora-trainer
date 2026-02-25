@@ -95,6 +95,7 @@ class GenerationParams:
 
     # Text Inputs
     caption: str = ""
+    style_tag: str = ""  # LoRA trigger word — prepended to caption after CoT processing
     lyrics: str = ""
     instrumental: bool = False
 
@@ -551,6 +552,12 @@ def generate_music(
                 dit_input_caption = lm_generated_metadata.get("caption", dit_input_caption)
             if params.use_cot_language:
                 dit_input_vocal_language = lm_generated_metadata.get("vocal_language", dit_input_vocal_language)
+
+        # Prepend LoRA style tag (trigger word) to caption — after CoT so it's not rewritten
+        if params.style_tag and params.style_tag.strip():
+            tag = params.style_tag.strip()
+            dit_input_caption = f"{tag} {dit_input_caption}" if dit_input_caption else tag
+            logger.info(f"[generate_music] Prepended style_tag '{tag}' to caption")
 
         # Phase 2: DiT music generation
         # Use seed_for_generation (from config.seed or params.seed) instead of params.seed for actual generation
