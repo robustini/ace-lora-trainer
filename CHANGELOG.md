@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-02-25c — Model Mismatch Check for Preprocessed Tensors
+
+### Safety: Prevent training with wrong model's tensors
+- Preprocessed tensors now record **which DiT checkpoint** was used to generate them (`model_checkpoint` field in `.pt` metadata + `manifest.json`)
+- At training start, the trainer verifies the tensors were preprocessed with the **same model** currently loaded
+- **Mismatch → training blocked** with clear error: *"Tensors were preprocessed with 'acestep-v15-turbo' but current model is 'acestep-v15-base'"*
+- **Why:** The DiT encoder (used during preprocessing to produce `encoder_hidden_states`) has different weights between base and turbo models. Using turbo-preprocessed tensors with a base model (or vice versa) would silently produce degraded results
+- **Backward compatible:** Old tensors without `model_checkpoint` metadata still work (warning logged, training proceeds)
+
+---
+
 ## 2026-02-25b — Fix torch_dtype for Captioner & Transcriber
 
 ### Fix: Models loading in float32 despite auto-dtype detection

@@ -1095,6 +1095,7 @@ class DatasetBuilder:
         max_duration: float = 240.0,
         progress_callback=None,
         audio_normalization: str = "none",
+        model_checkpoint: str = "",
     ) -> Tuple[List[str], str]:
         """Preprocess all labeled samples to tensor files for efficient training.
         
@@ -1323,6 +1324,7 @@ class DatasetBuilder:
                         "is_instrumental": sample.is_instrumental,
                         "custom_tag": sample.custom_tag,
                         "tag_position": self.metadata.tag_position,
+                        "model_checkpoint": model_checkpoint,
                     }
                 }
                 
@@ -1381,12 +1383,13 @@ class DatasetBuilder:
                 "target_sample_rate": target_sample_rate,
                 "genre_ratio": genre_ratio,
                 "audio_normalization": audio_normalization,
+                "model_checkpoint": model_checkpoint,
             },
         }
         manifest_path = os.path.join(output_dir, "manifest.json")
         with open(manifest_path, 'w', encoding='utf-8') as f:
             json.dump(manifest, f, indent=2)
-        
+
         status = f"✅ Preprocessed {success_count}/{len(labeled_samples)} samples to {output_dir}"
         if fail_count > 0:
             status += f" ({fail_count} failed)"
@@ -1400,6 +1403,7 @@ class DatasetBuilder:
         max_duration: float = 240.0,
         progress_callback=None,
         audio_normalization: str = "none",
+        model_checkpoint: str = "",
     ) -> Tuple[List[str], str]:
         """Two-pass preprocessing for low-VRAM GPUs (8-12GB).
 
@@ -1566,6 +1570,7 @@ class DatasetBuilder:
                         "is_instrumental": sample.is_instrumental,
                         "custom_tag": sample.custom_tag,
                         "tag_position": self.metadata.tag_position,
+                        "model_checkpoint": model_checkpoint,
                     },
                     "sample_id": sample.id,
                 }
@@ -1702,6 +1707,7 @@ class DatasetBuilder:
                 "genre_ratio": self.metadata.genre_ratio,
                 "audio_normalization": audio_normalization,
                 "mode": "two_pass",
+                "model_checkpoint": model_checkpoint,
             },
         }
         manifest_path = os.path.join(output_dir, "manifest.json")

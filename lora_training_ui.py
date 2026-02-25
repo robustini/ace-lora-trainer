@@ -870,12 +870,16 @@ def preprocess_dataset(
     if norm_mode in ("none", "no", ""):
         norm_mode = "none"
 
+    # Pass model checkpoint name so tensors record which model was used
+    model_ckpt = dit_handler._init_params.get("config_path", "") if hasattr(dit_handler, '_init_params') else ""
+
     output_paths, status = builder_state.preprocess_to_tensors(
         dit_handler=dit_handler,
         output_dir=output_dir.strip(),
         max_duration=max_duration,
         progress_callback=progress_callback,
         audio_normalization=norm_mode,
+        model_checkpoint=model_ckpt,
     )
 
     workflow_state["tensors_ready"] = len(output_paths) > 0

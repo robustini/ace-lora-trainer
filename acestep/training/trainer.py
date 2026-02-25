@@ -620,6 +620,41 @@ class LoRATrainer:
             except Exception as e:
                 logger.debug(f"Could not extract trigger word from data: {e}")
 
+            # Verify tensor/model checkpoint match to prevent silent misuse
+            try:
+                tensor_checkpoint = ""
+                _sample = data_module.train_dataset[0] if len(data_module.train_dataset) > 0 else None
+                if isinstance(_sample, dict) and "metadata" in _sample:
+                    _meta = _sample["metadata"]
+                    if isinstance(_meta, dict):
+                        tensor_checkpoint = _meta.get("model_checkpoint", "")
+                if not tensor_checkpoint:
+                    # Fallback: read first .pt file directly
+                    import glob as glob_mod
+                    _pt_files = sorted(glob_mod.glob(os.path.join(tensor_dir, "*.pt")))
+                    if _pt_files:
+                        _first = torch.load(_pt_files[0], map_location="cpu", weights_only=False)
+                        if isinstance(_first, dict) and "metadata" in _first:
+                            tensor_checkpoint = _first["metadata"].get("model_checkpoint", "")
+
+                current_checkpoint = ""
+                if hasattr(self.dit_handler, '_init_params') and self.dit_handler._init_params:
+                    current_checkpoint = self.dit_handler._init_params.get("config_path", "")
+
+                if tensor_checkpoint and current_checkpoint and tensor_checkpoint != current_checkpoint:
+                    yield 0, 0.0, (
+                        f"❌ Model mismatch! Tensors were preprocessed with '{tensor_checkpoint}' "
+                        f"but current model is '{current_checkpoint}'. "
+                        f"Please re-preprocess the tensors with the correct model."
+                    )
+                    return
+                elif tensor_checkpoint and current_checkpoint:
+                    logger.info(f"[train] Model checkpoint match OK: tensors='{tensor_checkpoint}', model='{current_checkpoint}'")
+                elif not tensor_checkpoint:
+                    logger.warning("[train] Tensors missing 'model_checkpoint' metadata (old format). Skipping model match check.")
+            except Exception as e:
+                logger.debug(f"Could not verify model checkpoint match: {e}")
+
             crop_info = ""
             if self.training_config.max_latent_length > 0:
                 crop_secs = self.training_config.max_latent_length / 25  # 25 frames/sec
