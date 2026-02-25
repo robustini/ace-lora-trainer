@@ -221,6 +221,7 @@ def inject_lora_into_dit(
     model,
     lora_config: LoRAConfig,
     attention_type: str = "both",
+    train_mlp: bool = False,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Inject LoRA adapters into the DiT decoder of the model.
 
@@ -253,7 +254,32 @@ def inject_lora_into_dit(
         )
 
     # Resolve target modules based on attention type
-    resolved_targets = resolve_target_modules(model, lora_config, attention_type)
+    if train_mlp:
+        # Clone target modules to avoid mutating the original config
+        mlp_targets = ["gate_proj", "up_proj", "down_proj"]
+        original_targets = list(lora_config.target_modules)
+        for target in mlp_targets:
+            if target not in original_targets:
+                original_targets.append(target)
+        
+        # Temporarily override target_modules for resolution
+        from dataclasses import replace
+        modified_lora_config = replace(lora_config, target_modules=original_targets)
+        resolved_targets = resolve_target_modules(model, modified_lora_config, attention_type)
+        
+        # If filtering by attention, we MUST manually re-add the MLP modules
+        # because resolve_target_modules filters by "self_attn" or "cross_attn".
+        if attention_type != "both":
+            decoder = model.decoder if hasattr(model, 'decoder') else model
+            for name, module in decoder.named_modules():
+                if isinstance(module, nn.Linear):
+                    short_name = name.split(".")[-1]
+                    if short_name in mlp_targets and ".mlp." in name:
+                        if name not in resolved_targets:
+                            resolved_targets.append(name)
+            logger.info(f"MLP targeting enabled: added {len(mlp_targets)} projection types to {attention_type}-attention")
+    else:
+        resolved_targets = resolve_target_modules(model, lora_config, attention_type)
 
     # Get the decoder (DiT model)
     decoder = model.decoder
