@@ -120,7 +120,7 @@ class AceStepCaptioner:
             attn_impl = _detect_best_attn_implementation() if self._resolved_device == "cuda" else "eager"
 
             load_kwargs = dict(
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map="auto",
                 enable_audio_output=False,
             )
@@ -655,7 +655,7 @@ class AceStepCaptioner:
             self.transcriber_processor = Qwen2_5OmniProcessor.from_pretrained(transcriber_path)
 
             load_kwargs = dict(
-                dtype=dtype,
+                torch_dtype=dtype,
                 device_map="auto",
                 enable_audio_output=False,
             )
